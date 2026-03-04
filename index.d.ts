@@ -135,6 +135,55 @@ export declare class XerisClient {
   getSignaturesForAddress(address: string, limit?: number): Promise<any[]>;
 }
 
+export declare class XerisDApp {
+  constructor(opts?: { rpcUrl?: string; explorerUrl?: string; network?: string });
+  get publicKey(): string | null;
+  get connected(): boolean;
+  get provider(): any;
+
+  // Wallet detection
+  static detectProvider(): any;
+  static waitForProvider(timeoutMs?: number): Promise<any>;
+
+  // Connection
+  connect(opts?: { onlyIfTrusted?: boolean }): Promise<{ publicKey: string }>;
+  disconnect(): Promise<void>;
+
+  // Events
+  on(event: 'connect' | 'disconnect' | 'accountChanged', callback: (data?: any) => void): void;
+  off(event: string, callback: (data?: any) => void): void;
+
+  // Transaction methods (wallet signs)
+  sendInstruction(instructionData: Buffer | Uint8Array): Promise<{ signature: string }>;
+  transferXrs(to: string, amountXrs: number): Promise<{ signature: string }>;
+  stakeXrs(amountXrs: number): Promise<{ signature: string }>;
+  unstakeXrs(amountXrs: number): Promise<{ signature: string }>;
+  transferToken(tokenId: string, to: string, amount: number, decimals: number): Promise<{ signature: string }>;
+  swapTokens(poolId: string, tokenIn: string, amountIn: number, minAmountOut: number): Promise<{ signature: string }>;
+  buyOnLaunchpad(launchpadId: string, xrsAmountLamports: number, minTokensOut: number): Promise<{ signature: string }>;
+  sellOnLaunchpad(launchpadId: string, tokenAmount: number, minXrsOut: number): Promise<{ signature: string }>;
+  addLiquidity(poolId: string, amountA: number, amountB: number): Promise<{ signature: string }>;
+  removeLiquidity(poolId: string, lpAmount: number): Promise<{ signature: string }>;
+  wrapXrs(amountXrs: number): Promise<{ signature: string }>;
+  unwrapXrs(amountXrs: number): Promise<{ signature: string }>;
+  callContract(contractId: string, method: string, args: object): Promise<{ signature: string }>;
+  signMessage(message: string | Uint8Array): Promise<{ signature: Uint8Array }>;
+
+  // Read-only queries
+  getBalance(address?: string): Promise<number>;
+  getTokenAccounts(address?: string): Promise<any>;
+  getAccountInfo(address?: string): Promise<any>;
+  getLaunchpads(): Promise<any[]>;
+  getLaunchpadQuote(launchpadId: string, xrsAmountLamports: number): Promise<any>;
+  getContracts(): Promise<any[]>;
+  getContract(contractId: string): Promise<any>;
+  getSwapQuote(contractId: string, params: Record<string, string>): Promise<any>;
+  getTokenList(): Promise<any[]>;
+  getStats(): Promise<any>;
+  getTransaction(signature: string): Promise<any>;
+  airdrop(amountXrs: number): Promise<any>;
+}
+
 export declare namespace TestVectors {
   function nativeTransfer(): { description: string; hex: string; bytes: number[] };
   function stake(): { description: string; hex: string; bytes: number[] };

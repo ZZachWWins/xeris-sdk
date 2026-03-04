@@ -34,6 +34,53 @@ const result = await client.transferXrs(alice, recipientAddress, 5.0);
 console.log('Signature:', result.signature);
 ```
 
+## Building DeFi dApps
+
+If you're building a web dApp that runs inside the Xeris Command Center wallet browser, use `XerisDApp` instead of `XerisClient`. It connects to the user's wallet through the injected provider (`window.xeris`), so you never handle private keys. The wallet shows an approval popup for every transaction.
+
+```javascript
+const { XerisDApp } = require('xeris-sdk');
+
+const dapp = new XerisDApp();
+await dapp.connect();
+console.log('User wallet:', dapp.publicKey);
+
+// Transfer XRS (wallet signs it)
+await dapp.transferXrs(recipientAddress, 5.0);
+
+// Swap tokens on a DEX pool
+const quote = await dapp.getSwapQuote('pool_mtk_xrs', {
+  token_in: 'mytoken', amount_in: '1000000000000'
+});
+await dapp.swapTokens('pool_mtk_xrs', 'mytoken', 1000000000000, quote.min_out);
+
+// Buy on a launchpad
+const lq = await dapp.getLaunchpadQuote('launch_xyz', 1000000000);
+await dapp.buyOnLaunchpad('launch_xyz', 1000000000, Math.floor(lq.tokens_out * 0.95));
+
+// Add/remove liquidity
+await dapp.addLiquidity('pool_mtk_xrs', 100000000000, 50000000000);
+await dapp.removeLiquidity('pool_mtk_xrs', lpTokenAmount);
+
+// Wrap XRS for DEX trading
+await dapp.wrapXrs(10);
+
+// Read data (no wallet approval needed)
+const balance = await dapp.getBalance();
+const tokens = await dapp.getTokenAccounts();
+const pools = await dapp.getContracts();
+```
+
+**XerisClient vs XerisDApp:**
+
+| | XerisClient | XerisDApp |
+|---|---|---|
+| **Use case** | Server-side, bots, scripts | Browser dApps, DeFi frontends |
+| **Keys** | You provide a keypair | Wallet manages keys |
+| **Signing** | SDK signs directly | Wallet popup approves |
+| **Install** | `npm install xeris-sdk` | Same package |
+| **Runs in** | Node.js | Browser (WebView) |
+
 ## Features
 
 **Transactions** — Every XerisCoin instruction type is supported through a single method call. The SDK handles blockhash fetching, bincode encoding, Solana transaction wrapping, Ed25519 signing, and submission.

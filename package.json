@@ -1,6 +1,6 @@
 {
   "name": "xeris-sdk",
-  "version": "1.3.2",
+  "version": "1.4.0",
   "description": "Official JavaScript SDK for the XerisCoin (XRS) Layer 1 blockchain. Build wallets, submit transactions, query chain state, and interact with tokens, smart contracts, launchpads, and the Alexandria RWA protocol.",
   "main": "index.js",
   "types": "index.d.ts",

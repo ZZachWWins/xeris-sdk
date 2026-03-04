@@ -957,6 +957,505 @@ const TestVectors = {
 };
 
 // ============================================================================
+// DAPP WALLET ADAPTER
+// ============================================================================
+
+/**
+ * XerisDApp connects to the Xeris wallet provider injected by the
+ * Xeris Command Center (or any compatible wallet).
+ *
+ * This is the class dApp developers use in the browser. It detects
+ * window.xeris (or window.solana), connects to the user's wallet,
+ * and provides high-level methods for building and submitting
+ * transactions that the wallet signs on the user's behalf.
+ *
+ * Unlike XerisClient (which holds private keys and signs directly),
+ * XerisDApp never touches private keys. All signing goes through
+ * the wallet provider's approval popup.
+ *
+ * @example
+ * // In a browser dApp (React, Vue, plain HTML, etc.)
+ * import { XerisDApp } from 'xeris-sdk';
+ *
+ * const dapp = new XerisDApp();
+ * await dapp.connect();
+ * console.log("User wallet:", dapp.publicKey);
+ *
+ * await dapp.transferXrs(recipientAddress, 5.0);
+ * await dapp.swapTokens("pool_mtk_xrs", "mytoken", 1000, 90);
+ */
+class XerisDApp {
+  /**
+   * Create a new dApp adapter.
+   * @param {object} [opts={}] - Configuration
+   * @param {string} [opts.rpcUrl] - Override RPC URL (otherwise fetched from wallet)
+   * @param {string} [opts.explorerUrl] - Override Explorer URL
+   * @param {string} [opts.network='mainnet'] - Network name
+   */
+  constructor(opts = {}) {
+    this._provider = null;
+    this._publicKey = null;
+    this._rpcUrl = opts.rpcUrl || null;
+    this._explorerUrl = opts.explorerUrl || null;
+    this._connected = false;
+    this._listeners = {};
+  }
+
+  /** @returns {string|null} The connected wallet's public key (base58) */
+  get publicKey() {
+    return this._publicKey ? this._publicKey.toString() : null;
+  }
+
+  /** @returns {boolean} Whether a wallet is connected */
+  get connected() {
+    return this._connected;
+  }
+
+  /** @returns {object|null} The raw wallet provider (window.xeris) */
+  get provider() {
+    return this._provider;
+  }
+
+  // --------------------------------------------------------------------------
+  // Wallet detection and connection
+  // --------------------------------------------------------------------------
+
+  /**
+   * Detect the wallet provider. Checks window.xeris first, then window.solana.
+   * @returns {object|null} The provider, or null if no wallet found
+   */
+  static detectProvider() {
+    if (typeof window === 'undefined') return null;
+    if (window.xeris) return window.xeris;
+    if (window.solana && window.solana.isXeris) return window.solana;
+    if (window.solana) return window.solana;
+    return null;
+  }
+
+  /**
+   * Wait for the wallet provider to become available.
+   * Useful when your script loads before the provider is injected.
+   * @param {number} [timeoutMs=3000] - How long to wait
+   * @returns {Promise<object|null>} The provider, or null on timeout
+   */
+  static waitForProvider(timeoutMs = 3000) {
+    return new Promise((resolve) => {
+      const provider = XerisDApp.detectProvider();
+      if (provider) return resolve(provider);
+
+      const start = Date.now();
+      const interval = setInterval(() => {
+        const p = XerisDApp.detectProvider();
+        if (p) {
+          clearInterval(interval);
+          resolve(p);
+        } else if (Date.now() - start > timeoutMs) {
+          clearInterval(interval);
+          resolve(null);
+        }
+      }, 100);
+
+      // Also listen for the wallet-standard event
+      try {
+        window.addEventListener('wallet-standard:app-ready', () => {
+          const p = XerisDApp.detectProvider();
+          if (p) {
+            clearInterval(interval);
+            resolve(p);
+          }
+        }, { once: true });
+      } catch (e) { /* ignore in non-browser */ }
+    });
+  }
+
+  /**
+   * Connect to the user's wallet. Shows an approval popup in the wallet
+   * if this is the first connection.
+   *
+   * @param {object} [opts={}]
+   * @param {boolean} [opts.onlyIfTrusted=false] - Only connect if previously approved
+   * @returns {Promise<{publicKey: string}>}
+   * @throws {Error} If no wallet found or user rejects
+   */
+  async connect(opts = {}) {
+    this._provider = XerisDApp.detectProvider();
+    if (!this._provider) {
+      // Wait briefly in case injection is delayed
+      this._provider = await XerisDApp.waitForProvider(2000);
+    }
+    if (!this._provider) {
+      throw new Error(
+        'Xeris wallet not found. Make sure you are using the Xeris Command Center browser or have a compatible wallet installed.'
+      );
+    }
+
+    const result = await this._provider.connect({
+      onlyIfTrusted: opts.onlyIfTrusted || false,
+    });
+
+    this._publicKey = result.publicKey;
+    this._connected = true;
+
+    // Fetch RPC URL from wallet if not set
+    if (!this._rpcUrl && this._provider.getRpcUrl) {
+      try {
+        this._rpcUrl = await this._provider.getRpcUrl();
+      } catch (e) {
+        this._rpcUrl = `http://${TESTNET_SEED}:${DEFAULT_RPC_PORT}`;
+      }
+    }
+    if (!this._explorerUrl) {
+      // Derive explorer URL from RPC URL
+      const base = this._rpcUrl ? this._rpcUrl.replace(`:${DEFAULT_RPC_PORT}`, '') : `http://${TESTNET_SEED}`;
+      this._explorerUrl = `${base}:${DEFAULT_EXPLORER_PORT}`;
+    }
+
+    // Forward wallet events
+    if (this._provider.on) {
+      this._provider.on('disconnect', () => {
+        this._connected = false;
+        this._publicKey = null;
+        this._emit('disconnect');
+      });
+      this._provider.on('accountChanged', (pk) => {
+        this._publicKey = pk;
+        this._emit('accountChanged', pk ? pk.toString() : null);
+      });
+    }
+
+    this._emit('connect', { publicKey: this.publicKey });
+    return { publicKey: this.publicKey };
+  }
+
+  /**
+   * Disconnect from the wallet.
+   */
+  async disconnect() {
+    if (this._provider && this._provider.disconnect) {
+      await this._provider.disconnect();
+    }
+    this._connected = false;
+    this._publicKey = null;
+    this._emit('disconnect');
+  }
+
+  // --------------------------------------------------------------------------
+  // Event system
+  // --------------------------------------------------------------------------
+
+  /** @param {string} event - 'connect', 'disconnect', 'accountChanged' */
+  on(event, callback) {
+    if (!this._listeners[event]) this._listeners[event] = [];
+    this._listeners[event].push(callback);
+  }
+
+  off(event, callback) {
+    if (!this._listeners[event]) return;
+    this._listeners[event] = this._listeners[event].filter(cb => cb !== callback);
+  }
+
+  /** @private */
+  _emit(event, data) {
+    if (!this._listeners[event]) return;
+    this._listeners[event].forEach(cb => { try { cb(data); } catch (e) {} });
+  }
+
+  // --------------------------------------------------------------------------
+  // Internal: build + sign through wallet
+  // --------------------------------------------------------------------------
+
+  /** @private */
+  _requireConnected() {
+    if (!this._connected || !this._provider) {
+      throw new Error('Wallet not connected. Call dapp.connect() first.');
+    }
+  }
+
+  /** @private - Fetch from RPC */
+  async _get(url) {
+    const resp = await fetch(url);
+    return resp.json();
+  }
+
+  /** @private - Post to RPC */
+  async _post(url, body) {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return resp.json();
+  }
+
+  /** @private - JSON-RPC call */
+  async _jsonRpc(method, params = []) {
+    const data = await this._post(this._explorerUrl, {
+      jsonrpc: '2.0', id: 1, method, params,
+    });
+    if (data.error) throw new Error(JSON.stringify(data.error));
+    return data.result;
+  }
+
+  /**
+   * Build a transaction from instruction data, have the wallet sign it,
+   * and submit it to the network.
+   *
+   * This is the core method that all high-level transaction methods use.
+   * The wallet shows an approval popup before signing.
+   *
+   * @param {Buffer|Uint8Array} instructionData - Encoded XerisInstruction
+   * @returns {Promise<{signature: string}>}
+   */
+  async sendInstruction(instructionData) {
+    this._requireConnected();
+
+    // 1. Get blockhash
+    const result = await this._jsonRpc('getLatestBlockhash');
+    const blockhashHex = result.value.blockhash;
+    const blockhashBytes = new Uint8Array(
+      blockhashHex.match(/.{2}/g).map(b => parseInt(b, 16))
+    );
+    const blockhash = bs58.encode(blockhashBytes);
+
+    // 2. Build unsigned Solana transaction
+    const pubkey = new PublicKey(this.publicKey);
+    const instruction = new TransactionInstruction({
+      keys: [{ pubkey, isSigner: true, isWritable: true }],
+      programId: new PublicKey(Buffer.alloc(32)),
+      data: Buffer.from(instructionData),
+    });
+
+    const tx = new Transaction();
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = pubkey;
+    tx.add(instruction);
+
+    // 3. Send to wallet for signing and submission
+    const resp = await this._provider.signAndSendTransaction(tx);
+    return { signature: resp.signature };
+  }
+
+  // --------------------------------------------------------------------------
+  // High-level transaction methods (wallet signs, no keys needed)
+  // --------------------------------------------------------------------------
+
+  /**
+   * Transfer native XRS. The wallet will show an approval popup.
+   * @param {string} to - Recipient address
+   * @param {number} amountXrs - Amount in XRS (e.g. 5.0)
+   */
+  async transferXrs(to, amountXrs) {
+    const lamports = Math.round(amountXrs * LAMPORTS_PER_XRS);
+    return this.sendInstruction(Instructions.nativeTransfer(this.publicKey, to, lamports));
+  }
+
+  /**
+   * Stake XRS for mining eligibility.
+   * @param {number} amountXrs - Amount to stake (minimum 1,000 XRS)
+   */
+  async stakeXrs(amountXrs) {
+    const lamports = Math.round(amountXrs * LAMPORTS_PER_XRS);
+    return this.sendInstruction(Instructions.stake(this.publicKey, lamports));
+  }
+
+  /**
+   * Begin unstaking XRS.
+   * @param {number} amountXrs - Amount to unstake
+   */
+  async unstakeXrs(amountXrs) {
+    const lamports = Math.round(amountXrs * LAMPORTS_PER_XRS);
+    return this.sendInstruction(Instructions.unstake(this.publicKey, lamports));
+  }
+
+  /**
+   * Transfer tokens.
+   * @param {string} tokenId - Token to transfer
+   * @param {string} to - Recipient
+   * @param {number} amount - Whole tokens
+   * @param {number} decimals - Token decimals
+   */
+  async transferToken(tokenId, to, amount, decimals) {
+    const amountBase = BigInt(amount) * BigInt(10 ** decimals);
+    return this.sendInstruction(Instructions.tokenTransfer(tokenId, this.publicKey, to, amountBase));
+  }
+
+  /**
+   * Swap tokens through a liquidity pool.
+   * @param {string} poolId - Pool contract ID
+   * @param {string} tokenIn - Token you're selling
+   * @param {number} amountIn - Amount in base units (lamports)
+   * @param {number} minAmountOut - Minimum output (slippage protection)
+   */
+  async swapTokens(poolId, tokenIn, amountIn, minAmountOut) {
+    return this.sendInstruction(Instructions.contractCall(poolId, 'swap', {
+      token_in: tokenIn,
+      amount_in: amountIn,
+      min_amount_out: minAmountOut,
+    }));
+  }
+
+  /**
+   * Buy tokens on a launchpad bonding curve.
+   * @param {string} launchpadId - Launchpad contract ID
+   * @param {number} xrsAmountLamports - XRS to spend (in lamports)
+   * @param {number} minTokensOut - Minimum tokens to receive
+   */
+  async buyOnLaunchpad(launchpadId, xrsAmountLamports, minTokensOut) {
+    return this.sendInstruction(Instructions.contractCall(launchpadId, 'buy_tokens', {
+      xrs_amount: xrsAmountLamports,
+      min_tokens_out: minTokensOut,
+    }));
+  }
+
+  /**
+   * Sell tokens on a launchpad bonding curve.
+   * @param {string} launchpadId - Launchpad contract ID
+   * @param {number} tokenAmount - Tokens to sell (in base units)
+   * @param {number} minXrsOut - Minimum XRS to receive (in lamports)
+   */
+  async sellOnLaunchpad(launchpadId, tokenAmount, minXrsOut) {
+    return this.sendInstruction(Instructions.contractCall(launchpadId, 'sell_tokens', {
+      token_amount: tokenAmount,
+      min_xrs_out: minXrsOut,
+    }));
+  }
+
+  /**
+   * Add liquidity to a pool.
+   * @param {string} poolId - Pool contract ID
+   * @param {number} amountA - Amount of token A (base units)
+   * @param {number} amountB - Amount of token B (base units)
+   */
+  async addLiquidity(poolId, amountA, amountB) {
+    return this.sendInstruction(Instructions.contractCall(poolId, 'add_liquidity', {
+      amount_a: amountA,
+      amount_b: amountB,
+    }));
+  }
+
+  /**
+   * Remove liquidity from a pool.
+   * @param {string} poolId - Pool contract ID
+   * @param {number} lpAmount - LP token amount to burn
+   */
+  async removeLiquidity(poolId, lpAmount) {
+    return this.sendInstruction(Instructions.contractCall(poolId, 'remove_liquidity', {
+      lp_amount: lpAmount,
+    }));
+  }
+
+  /**
+   * Wrap native XRS into xrs_native token for DEX trading.
+   * @param {number} amountXrs - Amount in XRS
+   */
+  async wrapXrs(amountXrs) {
+    const lamports = Math.round(amountXrs * LAMPORTS_PER_XRS);
+    return this.sendInstruction(Instructions.wrapXrs(lamports));
+  }
+
+  /**
+   * Unwrap xrs_native token back to native XRS.
+   * @param {number} amountXrs - Amount in XRS
+   */
+  async unwrapXrs(amountXrs) {
+    const lamports = Math.round(amountXrs * LAMPORTS_PER_XRS);
+    return this.sendInstruction(Instructions.unwrapXrs(lamports));
+  }
+
+  /**
+   * Call any contract method.
+   * @param {string} contractId - Contract ID
+   * @param {string} method - Method name
+   * @param {object} args - Method arguments
+   */
+  async callContract(contractId, method, args) {
+    return this.sendInstruction(Instructions.contractCall(contractId, method, args));
+  }
+
+  /**
+   * Sign an arbitrary message (for authentication, proof of ownership, etc.)
+   * @param {string|Uint8Array} message - Message to sign
+   * @returns {Promise<{signature: Uint8Array}>}
+   */
+  async signMessage(message) {
+    this._requireConnected();
+    return this._provider.signMessage(
+      typeof message === 'string' ? new TextEncoder().encode(message) : message
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Read-only queries (no wallet needed, but uses the wallet's RPC)
+  // --------------------------------------------------------------------------
+
+  /** Get balance in lamports. */
+  async getBalance(address) {
+    const addr = address || this.publicKey;
+    const result = await this._jsonRpc('getBalance', [addr]);
+    return result.value;
+  }
+
+  /** Get all token balances for the connected wallet. */
+  async getTokenAccounts(address) {
+    const addr = address || this.publicKey;
+    return this._get(`${this._rpcUrl}/token/accounts/${addr}`);
+  }
+
+  /** Get account info. */
+  async getAccountInfo(address) {
+    const addr = address || this.publicKey;
+    return this._get(`${this._explorerUrl}/v2/account/${addr}`);
+  }
+
+  /** Get all active launchpads. */
+  async getLaunchpads() {
+    return this._get(`${this._rpcUrl}/launchpads`);
+  }
+
+  /** Get a buy quote for a launchpad. */
+  async getLaunchpadQuote(launchpadId, xrsAmountLamports) {
+    return this._get(`${this._rpcUrl}/launchpad/${launchpadId}/quote?xrs_amount=${xrsAmountLamports}`);
+  }
+
+  /** Get all deployed contracts. */
+  async getContracts() {
+    return this._get(`${this._rpcUrl}/contracts`);
+  }
+
+  /** Get a specific contract's state. */
+  async getContract(contractId) {
+    return this._get(`${this._rpcUrl}/contract/${contractId}`);
+  }
+
+  /** Get a swap quote. */
+  async getSwapQuote(contractId, params) {
+    const qs = new URLSearchParams(params).toString();
+    return this._get(`${this._rpcUrl}/contract/${contractId}/quote?${qs}`);
+  }
+
+  /** Get all tokens. */
+  async getTokenList() {
+    return this._get(`${this._rpcUrl}/tokens`);
+  }
+
+  /** Get network stats. */
+  async getStats() {
+    return this._get(`${this._explorerUrl}/v2/stats`);
+  }
+
+  /** Get transaction detail. */
+  async getTransaction(signature) {
+    return this._get(`${this._explorerUrl}/v2/tx/${signature}`);
+  }
+
+  /** Request testnet airdrop. */
+  async airdrop(amountXrs) {
+    this._requireConnected();
+    return this._get(`${this._rpcUrl}/airdrop/${this.publicKey}/${Math.round(amountXrs)}`);
+  }
+}
+
+// ============================================================================
 // EXPORTS
 // ============================================================================
 
@@ -964,6 +1463,9 @@ module.exports = {
   // Core classes
   XerisClient,
   XerisKeypair,
+
+  // dApp adapter (browser, wallet-connected)
+  XerisDApp,
 
   // Instruction building
   Instructions,
