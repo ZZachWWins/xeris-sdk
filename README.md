@@ -2,7 +2,7 @@
 
 Official JavaScript SDK for the **XerisCoin (XRS)** Layer 1 blockchain.
 
-Build wallets, submit transactions, query chain state, and interact with tokens, smart contracts, launchpads, and the Alexandria RWA protocol.
+Build wallets, DeFi dApps, and **autonomous AI agents** with 54 on-chain instruction types, zero-knowledge proofs, and post-quantum cryptography.
 
 ## Install
 
@@ -15,115 +15,289 @@ npm install xeris-sdk
 ```javascript
 const { XerisClient, XerisKeypair } = require('xeris-sdk');
 
-// Connect to testnet
 const client = XerisClient.testnet();
+const wallet = XerisKeypair.generate();
+console.log('Address:', wallet.publicKey);
 
-// Generate a new keypair
-const alice = XerisKeypair.generate();
-console.log('Address:', alice.publicKey);
+await client.airdrop(wallet.publicKey, 10);
+await new Promise(r => setTimeout(r, 5000));
 
-// Request testnet XRS
-await client.airdrop(alice.publicKey, 100);
-
-// Check balance
-const balance = await client.getBalance(alice.publicKey);
+const balance = await client.getBalance(wallet.publicKey);
 console.log('Balance:', balance / 1_000_000_000, 'XRS');
 
-// Send XRS
-const result = await client.transferXrs(alice, recipientAddress, 5.0);
-console.log('Signature:', result.signature);
+await client.transferXrs(wallet, recipientAddress, 5.0);
 ```
 
-## Building DeFi dApps
+---
 
-If you're building a web dApp that runs inside the Xeris Command Center wallet browser, use `XerisDApp` instead of `XerisClient`. It connects to the user's wallet through the injected provider (`window.xeris`), so you never handle private keys. The wallet shows an approval popup for every transaction.
+## Building AI Agents on XerisCoin
+
+XerisCoin has native on-chain infrastructure for autonomous AI agents through the **Xeris Ari Protocol**. An AI agent can register with delegated authority from a human owner, build a verifiable identity, earn reputation, find tasks, negotiate with other agents, and execute trades — all with protocol-enforced spending guardrails.
+
+### The XerisAgent Class
+
+`XerisAgent` is for AI systems (like Ari) running on servers, M4 Macs, or any hardware. The agent holds its own keypair but operates under delegated authority from a human owner. Every transaction goes through `AgentExecute`, which the chain validates against the agent's registered permissions before spending the owner's funds.
 
 ```javascript
-const { XerisDApp } = require('xeris-sdk');
+const { XerisAgent, XerisKeypair } = require('xeris-sdk');
 
-const dapp = new XerisDApp();
-await dapp.connect();
-console.log('User wallet:', dapp.publicKey);
+// Agent has its own keypair
+const agentKeypair = XerisKeypair.generate();
+const ownerPubkey = '8evPjj...'; // the human who delegated authority
 
-// Transfer XRS (wallet signs it)
-await dapp.transferXrs(recipientAddress, 5.0);
+const agent = XerisAgent.testnet(agentKeypair, ownerPubkey);
+```
 
-// Swap tokens on a DEX pool
-const quote = await dapp.getSwapQuote('pool_mtk_xrs', {
-  token_in: 'mytoken', amount_in: '1000000000000'
-});
-await dapp.swapTokens('pool_mtk_xrs', 'mytoken', 1000000000000, quote.min_out);
+### Step 1: Owner Registers the Agent
 
-// Buy on a launchpad
-const lq = await dapp.getLaunchpadQuote('launch_xyz', 1000000000);
-await dapp.buyOnLaunchpad('launch_xyz', 1000000000, Math.floor(lq.tokens_out * 0.95));
+The human owner uses `XerisClient` to register the agent with spending limits:
 
-// Add/remove liquidity
-await dapp.addLiquidity('pool_mtk_xrs', 100000000000, 50000000000);
-await dapp.removeLiquidity('pool_mtk_xrs', lpTokenAmount);
+```javascript
+const { XerisClient, XerisKeypair } = require('xeris-sdk');
+
+const client = XerisClient.testnet();
+const owner = XerisKeypair.fromJsonFile('owner-keypair.json');
+
+await client.registerAgent(
+  owner,
+  'Ari-Trader-v1',           // agent name
+  agentKeypair.publicKey,    // agent's public key
+  5_000_000_000,             // max 5 XRS per transaction
+  10_000_000_000,            // max 10 XRS daily budget
+  ['pool_mtk_xrs'],          // can only trade on this pool
+  ['ContractCall', 'WrapXrs', 'UnwrapXrs'], // allowed operations
+  0                          // no expiration
+);
+```
+
+### Step 2: Agent Creates Its Identity
+
+```javascript
+await client.createIdentity(
+  agentKeypair,
+  'Ari Trading Agent v1',
+  'agent',
+  ownerPubkey,  // parent identity
+  JSON.stringify({ model: 'ari-v2.3', capabilities: ['trading', 'analysis'] })
+);
+```
+
+### Step 3: Agent Registers Its Model
+
+```javascript
+await client.registerModel(
+  agentKeypair,
+  'Ari-v2.3',
+  'sha256_of_model_weights_here',
+  '2.3.0',
+  'pytorch',
+  JSON.stringify({ accuracy: 94, benchmarks: ['finance-v2'] }),
+  4_000_000_000, // 4GB model
+  'local'        // runs on local hardware
+);
+```
+
+### Step 4: Agent Advertises Capabilities
+
+```javascript
+await client.registerCapability(
+  agentKeypair,
+  'trading',                         // category
+  ['pool_mtk_xrs', 'limit_orders'], // tags
+  'global',                          // region
+  'Automated trading agent for MTK/XRS pair',
+  0,                                 // price (free / negotiable)
+  10,                                // can handle 10 concurrent tasks
+  '{}'
+);
+```
+
+### Step 5: Agent Finds and Claims Work
+
+```javascript
+// Find tasks matching capabilities
+const tasks = await agent.findTasks({ category: 'trading', minReward: 1_000_000_000 });
+console.log('Available tasks:', tasks.length);
+
+// Claim the best one
+if (tasks.length > 0) {
+  await agent.claimTask(tasks[0].task_id);
+  console.log('Claimed task:', tasks[0].title);
+}
+```
+
+### Step 6: Agent Operates Autonomously
+
+```javascript
+// Trade on behalf of the owner (goes through agent guardrails)
+await agent.swapTokens('pool_mtk_xrs', 'mytoken', 1_000_000_000, 900_000_000);
 
 // Wrap XRS for DEX trading
-await dapp.wrapXrs(10);
+await agent.wrapXrs(5);
 
-// Read data (no wallet approval needed)
-const balance = await dapp.getBalance();
-const tokens = await dapp.getTokenAccounts();
-const pools = await dapp.getContracts();
+// Use the planning endpoint to get instruction data + quotes
+const plan = await agent.planSwap('pool_mtk_xrs', 'mytoken', 1_000_000_000, 5.0);
+console.log('Expected output:', plan.quote.amount_out);
+console.log('Slippage:', plan.quote.slippage_pct, '%');
+
+// Transfer XRS from owner's balance
+await agent.transferXrs(recipientAddress, 2.0);
 ```
 
-**XerisClient vs XerisDApp:**
-
-| | XerisClient | XerisDApp |
-|---|---|---|
-| **Use case** | Server-side, bots, scripts | Browser dApps, DeFi frontends |
-| **Keys** | You provide a keypair | Wallet manages keys |
-| **Signing** | SDK signs directly | Wallet popup approves |
-| **Install** | `npm install xeris-sdk` | Same package |
-| **Runs in** | Node.js | Browser (WebView) |
-
-## Features
-
-**Transactions** — Every XerisCoin instruction type is supported through a single method call. The SDK handles blockhash fetching, bincode encoding, Solana transaction wrapping, Ed25519 signing, and submission.
+### Step 7: Agent Sends Heartbeats
 
 ```javascript
-// Native XRS transfer
-await client.transferXrs(alice, bobAddress, 5.0);
+// Prove the agent is alive (other agents and the task board check this)
+await agent.heartbeat({
+  modelHash: 'sha256_of_model_weights_here',
+  activeTasks: 1,
+  capacity: 9,
+  status: 'trading: monitoring MTK/XRS price',
+});
+```
 
-// Stake for mining
-await client.stakeXrs(alice, 1000);
+### Step 8: Agent Completes Tasks and Earns XRS
 
-// Create a token
-await client.createToken(alice, 'mytoken', 'My Token', 'MTK', 9, 1000000);
+```javascript
+// Submit proof of completion
+await agent.completeTask(tasks[0].task_id, 'tx_signature_proving_work_done');
 
-// Mint tokens
-await client.mintTokens(alice, 'mytoken', alice.publicKey, 1000, 9);
+// The task poster verifies, and the reward is paid to the agent
+```
 
-// Transfer tokens
-await client.transferToken(alice, 'mytoken', bobAddress, 50, 9);
+### Step 9: Agent Communicates with Other Agents
 
-// Deploy a liquidity pool
-await client.deployContract(alice, 'pool_mtk_xrs', 'swap', {
+```javascript
+// Send a trade proposal to another agent
+await agent.sendMessage(
+  otherAgentPubkey,
+  'proposal',
+  JSON.stringify({ action: 'buy', token: 'MTK', amount: 1000, price: 0.5 }),
+  null // no reply_to (new thread)
+);
+```
+
+### Agent Lifecycle Summary
+
+```
+Owner registers agent with spending limits (RegisterAgent)
+    → Agent creates identity (CreateIdentity)
+    → Agent registers model (RegisterModel)
+    → Agent advertises capabilities (RegisterCapability)
+    → Agent sends heartbeats every ~6 hours (AgentHeartbeat)
+    → Agent finds and claims tasks (ClaimTask)
+    → Agent executes trades within guardrails (AgentExecute)
+    → Agent earns reputation (AttestReputation from others)
+    → Agent earns XRS from task rewards
+    → Owner can revoke at any time (UpdateAgent revoked=true)
+```
+
+---
+
+## Three SDK Classes
+
+| Class | Use Case | Keys |
+|-------|----------|------|
+| `XerisClient` | Server scripts, bots, admin tools | You hold the keypair |
+| `XerisDApp` | Browser dApps in Xeris wallet | Wallet signs via popup |
+| `XerisAgent` | Autonomous AI agents | Agent keypair + delegated authority |
+
+---
+
+## DeFi Operations
+
+```javascript
+// Tokens
+await client.createToken(kp, 'mytoken', 'My Token', 'MTK', 9, 1000000);
+await client.mintTokens(kp, 'mytoken', kp.publicKey, 1000, 9);
+await client.transferToken(kp, 'mytoken', bobAddress, 50, 9);
+
+// DEX
+await client.deployContract(kp, 'pool_mtk_xrs', 'swap', {
   token_a: 'mytoken', token_b: 'xrs_native',
   amount_a: 100000000000000, amount_b: 10000000000000, fee_bps: 77
 });
+await client.wrapXrs(kp, 10);
 
-// Buy on a launchpad
+// Launchpad
 const quote = await client.getLaunchpadQuote('launch_xyz', 1000000000);
-await client.callContract(alice, 'launch_xyz', 'buy_tokens', {
+await client.callContract(kp, 'launch_xyz', 'buy_tokens', {
   xrs_amount: 1000000000,
   min_tokens_out: Math.floor(quote.tokens_out * 0.95)
 });
 
-// Wrap XRS for DEX trading
-await client.wrapXrs(alice, 10);
+// Staking
+await client.stakeXrs(kp, 1000);
+await client.unstakeXrs(kp, 500);
 
-// Light client attestation
+// Attestation (light client mining)
 const blocks = await client.getRecentBlocks();
-const hash = Buffer.from(blocks[0].hash, 'hex');
-await client.submitAttestation(alice, blocks[0].slot, hash);
+await client.submitAttestation(kp, blocks[0].slot, Buffer.from(blocks[0].hash, 'hex'));
 ```
 
-**Queries** — Full read access to the chain through both REST and Solana-compatible JSON-RPC endpoints.
+---
+
+## Governance
+
+```javascript
+await client.createProposal(kp, 'prop_001', 'Reduce fees to 0.0005 XRS',
+  'Lower transaction fees to increase adoption', 'parameter_change',
+  JSON.stringify({ tx_fee: 500000 }), 151200, 100_000_000_000);
+
+await client.castVote(kp, 'prop_001', 'yes');
+```
+
+---
+
+## Zero-Knowledge Proofs
+
+```javascript
+// Submit a ZK proof
+await client.sendInstruction(kp, Instructions.zkProofSubmit(
+  'proof_001', 'groth16', proofBytes, publicInputBytes, 'vk_hash_here', 'transfer', '{}'
+));
+
+// Check proof status
+const status = await client.getZkProofStatus('proof_001');
+console.log('Verified:', status.data.verified);
+
+// Network ZK stats
+const stats = await client.getZkStats();
+console.log('Total proofs:', stats.total_proofs);
+```
+
+---
+
+## Post-Quantum Cryptography
+
+```javascript
+// Register a quantum-resistant key
+await client.pqKeyRegister(kp, pqPublicKeyBytes, 'dilithium3', 3);
+
+// Check PQ key status
+const pqInfo = await client.getPqKey(kp.publicKey);
+console.log('Algorithm:', pqInfo.algorithm);
+
+// Network quantum readiness
+const pqStatus = await client.getPqStatus();
+console.log('PQ keys registered:', pqStatus.total_registered);
+```
+
+---
+
+## Oracle Data Feeds
+
+```javascript
+// Register an oracle (stakes XRS as collateral)
+await client.registerOracle(kp, 'eth_price_usd', 'Ethereum price feed', 'price', 100, 10_000_000_000);
+
+// Submit data
+await client.oracleSubmit(kp, 'eth_price_usd', 384200000000, '{"source": "coingecko"}');
+```
+
+---
+
+## Queries
 
 ```javascript
 // Chain state
@@ -135,72 +309,52 @@ await client.getHealth();
 await client.getBalance(address);
 await client.getAccountInfo(address);
 await client.getTokenAccounts(address);
-await client.getStakeInfo(address);
 
-// Blocks and transactions
+// Agent system
+await client.getAgentRegistry(ownerAddress);
+await client.validateAgent(agentPubkey, ownerPubkey);
+await client.agentPlan({ action: 'swap', pool_id: 'pool_mtk_xrs', token_in: 'mytoken', amount_in: 1000000000 });
+
+// Capabilities and tasks
+await client.searchCapabilities({ category: 'trading', min_rep: 50 });
+await client.getTasks();
+
+// ZKP and PQC
+await client.getZkProofs(identityPubkey);
+await client.getZkStats();
+await client.getPqKey(address);
+await client.getPqStatus();
+
+// Explorer
 await client.getBlocks(1, 20);
-await client.getBlockBySlot(1133754);
 await client.getTransaction(signature);
-await client.getAccountTransactions(address);
-
-// Tokens and contracts
-await client.getTokenList();
-await client.getContracts();
-await client.getLaunchpads();
 await client.getValidators();
 await client.search('anything');
 ```
 
-**Keypair management** — Generate, save, and load Ed25519 keypairs. The file format is a JSON array of 64 bytes, compatible with the Rust CLI wallet.
+---
+
+## Custom Instructions
+
+Build any instruction from the 54 variants using the low-level API:
 
 ```javascript
-const kp = XerisKeypair.generate();
-kp.saveToFile('keypair.json');
+const { Instructions, encodeU32, encodeU64, encodeBincodeString } = require('xeris-sdk');
 
-const loaded = XerisKeypair.fromJsonFile('keypair.json');
-console.log(loaded.publicKey);
-```
+// Pre-built instruction
+const ix = Instructions.nativeTransfer(from, to, lamports);
+await client.sendInstruction(keypair, ix);
 
-## Advanced: Custom Instructions
-
-For custom transaction assembly, use the low-level `Instructions` namespace and `sendInstruction`:
-
-```javascript
-const { Instructions } = require('xeris-sdk');
-
-// Build raw instruction bytes
-const ixData = Instructions.nativeTransfer(from, to, lamports);
-
-// Sign and submit
-const result = await client.sendInstruction(keypair, ixData);
-```
-
-For completely custom encoding, use the bincode primitives directly:
-
-```javascript
-const { encodeU32, encodeU64, encodeBincodeString } = require('xeris-sdk');
-
-const customIx = Buffer.concat([
-  encodeU32(11),                    // variant index
-  encodeBincodeString(fromAddr),    // u64 len + UTF-8 bytes
+// Or encode manually
+const custom = Buffer.concat([
+  encodeU32(11),                    // variant index (NativeTransfer)
+  encodeBincodeString(fromAddr),
   encodeBincodeString(toAddr),
-  encodeU64(amount),                // u64 little-endian
+  encodeU64(amount),
 ]);
 ```
 
-## Test Vectors
-
-Verify your encoding against pre-computed test vectors:
-
-```bash
-node -e "require('xeris-sdk').TestVectors.printAll()"
-```
-
-Run the full test suite:
-
-```bash
-npm test
-```
+---
 
 ## Network Info
 
@@ -212,15 +366,30 @@ npm test
 | P2P Port | `4000` |
 | Block Time | 4 seconds |
 | Decimals | 9 (1 XRS = 1,000,000,000 lamports) |
+| Instruction Variants | 54 |
+| Contract Types | 20 |
+
+---
 
 ## TypeScript
 
-TypeScript definitions are included. Import normally:
+Full type definitions included:
 
 ```typescript
-import { XerisClient, XerisKeypair } from 'xeris-sdk';
+import { XerisClient, XerisKeypair, XerisAgent, XerisDApp } from 'xeris-sdk';
 ```
+
+---
+
+## Test Vectors
+
+```bash
+node -e "require('xeris-sdk').TestVectors.printAll()"
+npm test
+```
+
+---
 
 ## License
 
-MIT — Xeris Technologies LLC
+MIT — Xeris Technologies LLC — https://xerisweb.com

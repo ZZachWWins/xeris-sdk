@@ -13,7 +13,7 @@
  * await client.transferXrs(kp, recipientAddress, 5.0);
  *
  * @module xeris-sdk
- * @version 1.3.0
+ * @version 2.0.0
  * @license MIT
  * @author Xeris Technologies LLC
  * @see https://xerisweb.com
@@ -68,7 +68,69 @@ const Variant = Object.freeze({
   ValidatorAttestation: 12,
   WrapXrs:              13,
   UnwrapXrs:            14,
+  // Ari Protocol
+  RegisterAgent:        15,
+  UpdateAgent:          16,
+  AgentExecute:         17,
+  CreateIdentity:       18,
+  UpdateIdentity:       19,
+  AttestReputation:     20,
+  AgentMessage:         21,
+  SubDelegate:          22,
+  ConditionalOrder:     23,
+  CancelConditionalOrder: 24,
+  RegisterOracle:       25,
+  OracleSubmit:         26,
+  HardwareAttest:       27,
+  RegisterCapability:   28,
+  UpdateCapability:     29,
+  QueryCapabilities:    30,
+  PostTask:             31,
+  ClaimTask:            32,
+  ResolveTask:          33,
+  RegisterModel:        34,
+  UpdateModel:          35,
+  OpenDispute:          36,
+  ResolveDispute:       37,
+  SlashReport:          38,
+  CreateProposal:       39,
+  CastVote:             40,
+  ExecuteProposal:      41,
+  OpenChannel:          42,
+  CloseChannel:         43,
+  ForceCloseChannel:    44,
+  AgentHeartbeat:       45,
+  // ZKP + PQC
+  ZkProofSubmit:        46,
+  ZkProofVerify:        47,
+  ZkPrivateTransfer:    48,
+  ZkIdentityProof:      49,
+  PqKeyRegister:        50,
+  PqKeyRotate:          51,
+  PqSignedTransfer:     52,
+  PqAttest:             53,
 });
+
+/**
+ * Encode a binary swap call: 8 bytes input_amount LE + 8 bytes min_output LE.
+ * Used by DEX swap methods which expect raw bytes, not JSON.
+ * @param {string} contractId
+ * @param {string} method - "swap_a_to_b" or "swap_b_to_a"
+ * @param {number|bigint} inputAmount
+ * @param {number|bigint} minOutput
+ * @returns {Buffer}
+ */
+function encodeSwapCall(contractId, method, inputAmount, minOutput) {
+  const argsBuf = Buffer.alloc(16);
+  argsBuf.writeBigUInt64LE(BigInt(inputAmount), 0);
+  argsBuf.writeBigUInt64LE(BigInt(minOutput), 8);
+  return Buffer.concat([
+    encodeU32(Variant.ContractCall),
+    encodeBincodeString(contractId),
+    encodeBincodeString(method),
+    encodeBincodeVec(argsBuf),
+  ]);
+}
 
 // ============================================================================
 // BINCODE ENCODING PRIMITIVES
@@ -448,6 +510,383 @@ const Instructions = {
       encodeU64(amount),
     ]);
   },
+
+  // ── Ari Protocol Instructions (15-53) ──
+
+  registerAgent(agentName, agentPubkey, maxPerTx, maxDaily, allowedContracts, allowedOperations, expiresAtSlot) {
+    return Buffer.concat([
+      encodeU32(Variant.RegisterAgent),
+      encodeBincodeString(agentName),
+      encodeBincodeString(agentPubkey),
+      encodeU64(maxPerTx),
+      encodeU64(maxDaily),
+      encodeBincodeVec(Buffer.from(JSON.stringify(allowedContracts || []))),
+      encodeBincodeVec(Buffer.from(JSON.stringify(allowedOperations || []))),
+      encodeU64(expiresAtSlot || 0),
+    ]);
+  },
+
+  updateAgent(agentPubkey, opts = {}) {
+    return Buffer.concat([
+      encodeU32(Variant.UpdateAgent),
+      encodeBincodeString(agentPubkey),
+      encodeOption(opts.newMaxPerTx, encodeU64),
+      encodeOption(opts.newMaxDaily, encodeU64),
+      encodeOption(opts.newAllowedContracts, v => encodeBincodeVec(Buffer.from(JSON.stringify(v)))),
+      encodeOption(opts.newAllowedOperations, v => encodeBincodeVec(Buffer.from(JSON.stringify(v)))),
+      encodeOption(opts.newExpiresAtSlot, encodeU64),
+      encodeBool(opts.revoked || false),
+    ]);
+  },
+
+  agentExecute(ownerPubkey, innerInstruction) {
+    return Buffer.concat([
+      encodeU32(Variant.AgentExecute),
+      encodeBincodeString(ownerPubkey),
+      encodeBincodeVec(innerInstruction),
+    ]);
+  },
+
+  createIdentity(identityPubkey, displayName, identityType, parentIdentity, metadataJson) {
+    return Buffer.concat([
+      encodeU32(Variant.CreateIdentity),
+      encodeBincodeString(identityPubkey),
+      encodeBincodeString(displayName),
+      encodeBincodeString(identityType || 'agent'),
+      encodeBincodeString(parentIdentity || ''),
+      encodeBincodeString(metadataJson || '{}'),
+    ]);
+  },
+
+  updateIdentity(identityPubkey, opts = {}) {
+    return Buffer.concat([
+      encodeU32(Variant.UpdateIdentity),
+      encodeBincodeString(identityPubkey),
+      encodeOption(opts.newDisplayName, encodeBincodeString),
+      encodeOption(opts.newMetadata, encodeBincodeString),
+      encodeBool(opts.deactivated || false),
+    ]);
+  },
+
+  attestReputation(subjectPubkey, score, category, evidence) {
+    return Buffer.concat([
+      encodeU32(Variant.AttestReputation),
+      encodeBincodeString(subjectPubkey),
+      encodeU8(Math.min(100, Math.max(1, score))),
+      encodeBincodeString(category),
+      encodeBincodeString(evidence || ''),
+    ]);
+  },
+
+  agentMessage(toIdentity, messageType, payloadJson, replyTo, expiresAtSlot) {
+    return Buffer.concat([
+      encodeU32(Variant.AgentMessage),
+      encodeBincodeString(toIdentity),
+      encodeBincodeString(messageType),
+      encodeBincodeString(typeof payloadJson === 'string' ? payloadJson : JSON.stringify(payloadJson)),
+      encodeBincodeString(replyTo || ''),
+      encodeU64(expiresAtSlot || 0),
+    ]);
+  },
+
+  subDelegate(subAgentPubkey, subAgentName, maxPerTx, maxDaily, allowedContracts, allowedOperations, expiresAtSlot, maxDepth) {
+    return Buffer.concat([
+      encodeU32(Variant.SubDelegate),
+      encodeBincodeString(subAgentPubkey),
+      encodeBincodeString(subAgentName),
+      encodeU64(maxPerTx),
+      encodeU64(maxDaily),
+      encodeBincodeVec(Buffer.from(JSON.stringify(allowedContracts || []))),
+      encodeBincodeVec(Buffer.from(JSON.stringify(allowedOperations || []))),
+      encodeU64(expiresAtSlot || 0),
+      encodeU8(maxDepth || 0),
+    ]);
+  },
+
+  conditionalOrder(orderId, conditionType, conditionSource, conditionThreshold, innerInstruction, expiresAtSlot, lockedAmount) {
+    return Buffer.concat([
+      encodeU32(Variant.ConditionalOrder),
+      encodeBincodeString(orderId),
+      encodeBincodeString(conditionType),
+      encodeBincodeString(conditionSource),
+      encodeU64(conditionThreshold),
+      encodeBincodeVec(innerInstruction),
+      encodeU64(expiresAtSlot || 0),
+      encodeU64(lockedAmount || 0),
+    ]);
+  },
+
+  cancelConditionalOrder(orderId) {
+    return Buffer.concat([encodeU32(Variant.CancelConditionalOrder), encodeBincodeString(orderId)]);
+  },
+
+  registerOracle(oracleId, description, feedType, updateIntervalSlots, stakeAmount) {
+    return Buffer.concat([
+      encodeU32(Variant.RegisterOracle),
+      encodeBincodeString(oracleId),
+      encodeBincodeString(description),
+      encodeBincodeString(feedType),
+      encodeU64(updateIntervalSlots || 100),
+      encodeU64(stakeAmount),
+    ]);
+  },
+
+  oracleSubmit(oracleId, value, metadata) {
+    return Buffer.concat([
+      encodeU32(Variant.OracleSubmit),
+      encodeBincodeString(oracleId),
+      encodeU64(value),
+      encodeBincodeString(metadata || ''),
+    ]);
+  },
+
+  hardwareAttest(devicePubkey, deviceType, manufacturer, model, firmwareVersion, attestationProof, boundIdentity) {
+    return Buffer.concat([
+      encodeU32(Variant.HardwareAttest),
+      encodeBincodeString(devicePubkey),
+      encodeBincodeString(deviceType),
+      encodeBincodeString(manufacturer),
+      encodeBincodeString(model),
+      encodeBincodeString(firmwareVersion),
+      encodeBincodeVec(attestationProof),
+      encodeBincodeString(boundIdentity),
+    ]);
+  },
+
+  registerCapability(providerIdentity, category, tags, region, description, pricePerUnit, maxConcurrent, metadataJson) {
+    return Buffer.concat([
+      encodeU32(Variant.RegisterCapability),
+      encodeBincodeString(providerIdentity),
+      encodeBincodeString(category),
+      encodeBincodeVec(Buffer.from(JSON.stringify(tags || []))),
+      encodeBincodeString(region || 'global'),
+      encodeBincodeString(description || ''),
+      encodeU64(pricePerUnit || 0),
+      encodeU32(maxConcurrent || 0),
+      encodeBincodeString(metadataJson || '{}'),
+    ]);
+  },
+
+  postTask(taskId, title, description, requiredCategory, requiredTags, minReputation, reward, expiresAtSlot, maxClaimants, verification, verificationOracle, verificationThreshold) {
+    return Buffer.concat([
+      encodeU32(Variant.PostTask),
+      encodeBincodeString(taskId),
+      encodeBincodeString(title),
+      encodeBincodeString(description || ''),
+      encodeBincodeString(requiredCategory || ''),
+      encodeBincodeVec(Buffer.from(JSON.stringify(requiredTags || []))),
+      encodeU8(minReputation || 0),
+      encodeU64(reward),
+      encodeU64(expiresAtSlot || 0),
+      encodeU32(maxClaimants || 1),
+      encodeBincodeString(verification || 'poster_confirm'),
+      encodeBincodeString(verificationOracle || ''),
+      encodeU64(verificationThreshold || 0),
+    ]);
+  },
+
+  claimTask(taskId, claimantIdentity) {
+    return Buffer.concat([
+      encodeU32(Variant.ClaimTask),
+      encodeBincodeString(taskId),
+      encodeBincodeString(claimantIdentity),
+    ]);
+  },
+
+  resolveTask(taskId, resolution, proof) {
+    return Buffer.concat([
+      encodeU32(Variant.ResolveTask),
+      encodeBincodeString(taskId),
+      encodeBincodeString(resolution),
+      encodeBincodeString(proof || ''),
+    ]);
+  },
+
+  registerModel(identityPubkey, modelName, modelHash, modelVersion, framework, capabilitiesJson, modelSizeBytes, executionEnvironment) {
+    return Buffer.concat([
+      encodeU32(Variant.RegisterModel),
+      encodeBincodeString(identityPubkey),
+      encodeBincodeString(modelName),
+      encodeBincodeString(modelHash),
+      encodeBincodeString(modelVersion || '0.0.0'),
+      encodeBincodeString(framework || 'custom'),
+      encodeBincodeString(capabilitiesJson || '{}'),
+      encodeU64(modelSizeBytes || 0),
+      encodeBincodeString(executionEnvironment || 'local'),
+    ]);
+  },
+
+  openDispute(disputeId, disputeType, subjectId, reason, evidence, bond) {
+    return Buffer.concat([
+      encodeU32(Variant.OpenDispute),
+      encodeBincodeString(disputeId),
+      encodeBincodeString(disputeType),
+      encodeBincodeString(subjectId),
+      encodeBincodeString(reason),
+      encodeBincodeString(evidence || ''),
+      encodeU64(bond || 0),
+    ]);
+  },
+
+  resolveDispute(disputeId, action, data) {
+    return Buffer.concat([
+      encodeU32(Variant.ResolveDispute),
+      encodeBincodeString(disputeId),
+      encodeBincodeString(action),
+      encodeBincodeString(data || ''),
+    ]);
+  },
+
+  slashReport(agentPubkey, ownerPubkey, violationType, evidence, violationSlot) {
+    return Buffer.concat([
+      encodeU32(Variant.SlashReport),
+      encodeBincodeString(agentPubkey),
+      encodeBincodeString(ownerPubkey),
+      encodeBincodeString(violationType),
+      encodeBincodeString(evidence || ''),
+      encodeU64(violationSlot || 0),
+    ]);
+  },
+
+  createProposal(proposalId, title, description, proposalType, parameterJson, votingPeriodSlots, quorum) {
+    return Buffer.concat([
+      encodeU32(Variant.CreateProposal),
+      encodeBincodeString(proposalId),
+      encodeBincodeString(title),
+      encodeBincodeString(description || ''),
+      encodeBincodeString(proposalType || 'text'),
+      encodeBincodeString(parameterJson || '{}'),
+      encodeU64(votingPeriodSlots || 151200),
+      encodeU64(quorum || 0),
+    ]);
+  },
+
+  castVote(proposalId, vote) {
+    return Buffer.concat([
+      encodeU32(Variant.CastVote),
+      encodeBincodeString(proposalId),
+      encodeBincodeString(vote),
+    ]);
+  },
+
+  executeProposal(proposalId) {
+    return Buffer.concat([encodeU32(Variant.ExecuteProposal), encodeBincodeString(proposalId)]);
+  },
+
+  openChannel(channelId, counterparty, deposit, channelType, expiresAtSlot) {
+    return Buffer.concat([
+      encodeU32(Variant.OpenChannel),
+      encodeBincodeString(channelId),
+      encodeBincodeString(counterparty),
+      encodeU64(deposit),
+      encodeBincodeString(channelType || 'payment'),
+      encodeU64(expiresAtSlot || 0),
+    ]);
+  },
+
+  closeChannel(channelId, finalBalanceA, finalBalanceB, messageCount, counterpartySignature) {
+    return Buffer.concat([
+      encodeU32(Variant.CloseChannel),
+      encodeBincodeString(channelId),
+      encodeU64(finalBalanceA),
+      encodeU64(finalBalanceB),
+      encodeU64(messageCount || 0),
+      encodeBincodeVec(counterpartySignature || Buffer.alloc(0)),
+    ]);
+  },
+
+  agentHeartbeat(identityPubkey, currentModelHash, activeTasks, availableCapacity, statusMessage) {
+    return Buffer.concat([
+      encodeU32(Variant.AgentHeartbeat),
+      encodeBincodeString(identityPubkey),
+      encodeBincodeString(currentModelHash || ''),
+      encodeU32(activeTasks || 0),
+      encodeU32(availableCapacity || 0),
+      encodeBincodeString(statusMessage || ''),
+    ]);
+  },
+
+  zkProofSubmit(proofId, proofSystem, proofData, publicInputs, verificationKeyHash, proofType, metadataJson) {
+    return Buffer.concat([
+      encodeU32(Variant.ZkProofSubmit),
+      encodeBincodeString(proofId),
+      encodeBincodeString(proofSystem || 'groth16'),
+      encodeBincodeVec(proofData),
+      encodeBincodeVec(publicInputs),
+      encodeBincodeString(verificationKeyHash),
+      encodeBincodeString(proofType || 'custom'),
+      encodeBincodeString(metadataJson || '{}'),
+    ]);
+  },
+
+  zkProofVerify(proofId) {
+    return Buffer.concat([encodeU32(Variant.ZkProofVerify), encodeBincodeString(proofId)]);
+  },
+
+  zkPrivateTransfer(tokenId, from, to, amountCommitment, rangeProof, balanceProof, nullifier) {
+    return Buffer.concat([
+      encodeU32(Variant.ZkPrivateTransfer),
+      encodeBincodeString(tokenId),
+      encodeBincodeString(from),
+      encodeBincodeString(to),
+      encodeBincodeVec(amountCommitment),
+      encodeBincodeVec(rangeProof),
+      encodeBincodeVec(balanceProof),
+      encodeBincodeVec(nullifier),
+    ]);
+  },
+
+  zkIdentityProof(identityPubkey, claimType, claimValue, proofData, publicInputs) {
+    return Buffer.concat([
+      encodeU32(Variant.ZkIdentityProof),
+      encodeBincodeString(identityPubkey),
+      encodeBincodeString(claimType),
+      encodeU64(claimValue),
+      encodeBincodeVec(proofData),
+      encodeBincodeVec(publicInputs),
+    ]);
+  },
+
+  pqKeyRegister(ed25519Pubkey, pqPublicKey, pqAlgorithm, securityLevel) {
+    return Buffer.concat([
+      encodeU32(Variant.PqKeyRegister),
+      encodeBincodeString(ed25519Pubkey),
+      encodeBincodeVec(pqPublicKey),
+      encodeBincodeString(pqAlgorithm),
+      encodeU8(securityLevel || 3),
+    ]);
+  },
+
+  pqKeyRotate(ed25519Pubkey, newPqPublicKey, newPqAlgorithm, rotationProof) {
+    return Buffer.concat([
+      encodeU32(Variant.PqKeyRotate),
+      encodeBincodeString(ed25519Pubkey),
+      encodeBincodeVec(newPqPublicKey),
+      encodeBincodeString(newPqAlgorithm),
+      encodeBincodeVec(rotationProof),
+    ]);
+  },
+
+  pqSignedTransfer(from, to, amount, pqSignature, pqAlgorithm) {
+    return Buffer.concat([
+      encodeU32(Variant.PqSignedTransfer),
+      encodeBincodeString(from),
+      encodeBincodeString(to),
+      encodeU64(amount),
+      encodeBincodeVec(pqSignature),
+      encodeBincodeString(pqAlgorithm),
+    ]);
+  },
+
+  pqAttest(attestationType, referenceId, pqAlgorithm, verified) {
+    return Buffer.concat([
+      encodeU32(Variant.PqAttest),
+      encodeBincodeString(attestationType),
+      encodeBincodeString(referenceId),
+      encodeBincodeString(pqAlgorithm),
+      encodeBool(verified),
+    ]);
+  },
 };
 
 // ============================================================================
@@ -607,8 +1046,16 @@ class XerisClient {
    */
   async getLatestBlockhash() {
     const result = await this._jsonRpc('getLatestBlockhash');
-    const hexStr = result.value.blockhash;
-    return Buffer.from(hexStr, 'hex');
+    const raw = result.value.blockhash;
+    // BUG FIX: The node may return the blockhash as either a 64-char hex string
+    // or a base58-encoded string. Detect and handle both formats.
+    if (/^[0-9a-f]{64}$/i.test(raw)) {
+      // Hex string — decode to bytes
+      return Buffer.from(raw, 'hex');
+    } else {
+      // Already base58 — decode to bytes
+      return Buffer.from(bs58.decode(raw));
+    }
   }
 
   /**
@@ -906,6 +1353,117 @@ class XerisClient {
   /** Get recent signatures for an address. @returns {Promise<object[]>} */
   async getSignaturesForAddress(address, limit = 20) {
     return this._jsonRpc('getSignaturesForAddress', [address, { limit }]);
+  }
+
+  // --------------------------------------------------------------------------
+  // Ari Protocol queries
+  // --------------------------------------------------------------------------
+
+  /** Get all agents registered by an owner. */
+  async getAgentRegistry(owner) { return this._get(`${this.rpcUrl}/agent/registry/${owner}`); }
+
+  /** Check if an agent is currently authorized. */
+  async validateAgent(agentPubkey, owner) { return this._get(`${this.rpcUrl}/agent/validate/${agentPubkey}/${owner}`); }
+
+  /** Convert an intent to instruction data (for AI agents). */
+  async agentPlan(action) { return this._post(`${this.rpcUrl}/agent/plan`, action); }
+
+  /** Search capabilities by category, tags, region, reputation. */
+  async searchCapabilities(params = {}) {
+    const qs = new URLSearchParams(params).toString();
+    return this._get(`${this.rpcUrl}/capabilities/search?${qs}`);
+  }
+
+  /** Get all active capability listings. */
+  async getCapabilities() { return this._get(`${this.rpcUrl}/capabilities`); }
+
+  /** Get all open tasks. */
+  async getTasks() { return this._get(`${this.rpcUrl}/tasks`); }
+
+  /** Get a specific task. */
+  async getTask(taskId) { return this._get(`${this.rpcUrl}/tasks/${taskId}`); }
+
+  /** Get ZK proofs for an identity. */
+  async getZkProofs(identity) { return this._get(`${this.rpcUrl}/zk/proofs/${identity}`); }
+
+  /** Get ZK proof verification status. */
+  async getZkProofStatus(proofId) { return this._get(`${this.rpcUrl}/zk/verify/${proofId}`); }
+
+  /** Get global ZKP statistics. */
+  async getZkStats() { return this._get(`${this.rpcUrl}/zk/stats`); }
+
+  /** Get PQ key info for an address. */
+  async getPqKey(address) { return this._get(`${this.rpcUrl}/pq/keys/${address}`); }
+
+  /** Get network PQ adoption status. */
+  async getPqStatus() { return this._get(`${this.rpcUrl}/pq/status`); }
+
+  // --------------------------------------------------------------------------
+  // Ari Protocol transaction methods
+  // --------------------------------------------------------------------------
+
+  async registerAgent(keypair, agentName, agentPubkey, maxPerTx, maxDaily, allowedContracts, allowedOps, expiresAt) {
+    return this.sendInstruction(keypair, Instructions.registerAgent(agentName, agentPubkey, maxPerTx, maxDaily, allowedContracts, allowedOps, expiresAt));
+  }
+
+  async updateAgent(keypair, agentPubkey, opts) {
+    return this.sendInstruction(keypair, Instructions.updateAgent(agentPubkey, opts));
+  }
+
+  async createIdentity(keypair, displayName, identityType, parentIdentity, metadata) {
+    return this.sendInstruction(keypair, Instructions.createIdentity(keypair.publicKey, displayName, identityType, parentIdentity, metadata));
+  }
+
+  async attestReputation(keypair, subjectPubkey, score, category, evidence) {
+    return this.sendInstruction(keypair, Instructions.attestReputation(subjectPubkey, score, category, evidence));
+  }
+
+  async sendAgentMessage(keypair, toIdentity, messageType, payload, replyTo, expiresAt) {
+    return this.sendInstruction(keypair, Instructions.agentMessage(toIdentity, messageType, payload, replyTo, expiresAt));
+  }
+
+  async postTask(keypair, taskId, title, desc, category, tags, minRep, reward, expires, maxClaim, verification) {
+    return this.sendInstruction(keypair, Instructions.postTask(taskId, title, desc, category, tags, minRep, reward, expires, maxClaim, verification));
+  }
+
+  async claimTask(keypair, taskId) {
+    return this.sendInstruction(keypair, Instructions.claimTask(taskId, keypair.publicKey));
+  }
+
+  async resolveTask(keypair, taskId, resolution, proof) {
+    return this.sendInstruction(keypair, Instructions.resolveTask(taskId, resolution, proof));
+  }
+
+  async registerOracle(keypair, oracleId, description, feedType, intervalSlots, stakeAmount) {
+    return this.sendInstruction(keypair, Instructions.registerOracle(oracleId, description, feedType, intervalSlots, stakeAmount));
+  }
+
+  async oracleSubmit(keypair, oracleId, value, metadata) {
+    return this.sendInstruction(keypair, Instructions.oracleSubmit(oracleId, value, metadata));
+  }
+
+  async registerModel(keypair, modelName, modelHash, version, framework, capabilities, sizeBytes, environment) {
+    return this.sendInstruction(keypair, Instructions.registerModel(keypair.publicKey, modelName, modelHash, version, framework, capabilities, sizeBytes, environment));
+  }
+
+  async agentHeartbeat(keypair, modelHash, activeTasks, capacity, status) {
+    return this.sendInstruction(keypair, Instructions.agentHeartbeat(keypair.publicKey, modelHash, activeTasks, capacity, status));
+  }
+
+  async registerCapability(keypair, category, tags, region, description, price, maxConcurrent, metadata) {
+    return this.sendInstruction(keypair, Instructions.registerCapability(keypair.publicKey, category, tags, region, description, price, maxConcurrent, metadata));
+  }
+
+  async createProposal(keypair, proposalId, title, description, proposalType, parameterJson, votingPeriod, quorum) {
+    return this.sendInstruction(keypair, Instructions.createProposal(proposalId, title, description, proposalType, parameterJson, votingPeriod, quorum));
+  }
+
+  async castVote(keypair, proposalId, vote) {
+    return this.sendInstruction(keypair, Instructions.castVote(proposalId, vote));
+  }
+
+  async pqKeyRegister(keypair, pqPublicKey, algorithm, securityLevel) {
+    return this.sendInstruction(keypair, Instructions.pqKeyRegister(keypair.publicKey, pqPublicKey, algorithm, securityLevel));
   }
 }
 
@@ -1209,12 +1767,15 @@ class XerisDApp {
   async sendInstruction(instructionData) {
     this._requireConnected();
 
-    // 1. Get blockhash
+    // 1. Get blockhash (handles both hex and base58 from node)
     const result = await this._jsonRpc('getLatestBlockhash');
-    const blockhashHex = result.value.blockhash;
-    const blockhashBytes = new Uint8Array(
-      blockhashHex.match(/.{2}/g).map(b => parseInt(b, 16))
-    );
+    const raw = result.value.blockhash;
+    let blockhashBytes;
+    if (/^[0-9a-f]{64}$/i.test(raw)) {
+      blockhashBytes = new Uint8Array(raw.match(/.{2}/g).map(b => parseInt(b, 16)));
+    } else {
+      blockhashBytes = bs58.decode(raw);
+    }
     const blockhash = bs58.encode(blockhashBytes);
 
     // 2. Build unsigned Solana transaction
@@ -1286,12 +1847,26 @@ class XerisDApp {
    * @param {number} amountIn - Amount in base units (lamports)
    * @param {number} minAmountOut - Minimum output (slippage protection)
    */
+  /**
+   * Swap tokens through a liquidity pool.
+   * BUG FIX: Uses binary args (16 bytes LE) and correct method name
+   * (swap_a_to_b or swap_b_to_a) instead of JSON encoding.
+   * @param {string} poolId - Pool contract ID
+   * @param {string} tokenIn - Token you're selling
+   * @param {number} amountIn - Amount in base units (lamports)
+   * @param {number} minAmountOut - Minimum output (slippage protection)
+   */
   async swapTokens(poolId, tokenIn, amountIn, minAmountOut) {
-    return this.sendInstruction(Instructions.contractCall(poolId, 'swap', {
-      token_in: tokenIn,
-      amount_in: amountIn,
-      min_amount_out: minAmountOut,
-    }));
+    // Determine swap direction by checking which token the pool has as token_a
+    let method = 'swap_a_to_b';
+    try {
+      const pool = await this.getContract(poolId);
+      if (pool && pool.state) {
+        const state = pool.state.Swap || pool.state;
+        if (state.token_b === tokenIn) method = 'swap_b_to_a';
+      }
+    } catch (e) { /* default to a_to_b */ }
+    return this.sendInstruction(encodeSwapCall(poolId, method, amountIn, minAmountOut));
   }
 
   /**
@@ -1456,6 +2031,193 @@ class XerisDApp {
 }
 
 // ============================================================================
+// AI AGENT CLASS
+// ============================================================================
+
+/**
+ * XerisAgent — Autonomous AI agent that operates on XerisCoin.
+ *
+ * Designed for AI systems (like Ari) running on servers or local hardware.
+ * The agent holds its own keypair but operates under delegated authority
+ * from a human owner. All transactions go through AgentExecute, which
+ * the ledger validates against the agent's registered permissions.
+ *
+ * @example
+ * const agent = new XerisAgent(agentKeypair, ownerPubkey);
+ * await agent.connect();
+ * const tasks = await agent.findTasks({ category: 'trading' });
+ * await agent.claimTask(tasks[0].task_id);
+ * await agent.heartbeat({ status: 'working on task' });
+ */
+class XerisAgent {
+  constructor(keypair, ownerPubkey, host, opts = {}) {
+    this._keypair = keypair;
+    this._ownerPubkey = ownerPubkey;
+    this._client = new XerisClient(host || `http://${TESTNET_SEED}`, opts);
+  }
+
+  static testnet(keypair, ownerPubkey) {
+    return new XerisAgent(keypair, ownerPubkey, `http://${TESTNET_SEED}`);
+  }
+
+  get publicKey() { return this._keypair.publicKey; }
+  get ownerPubkey() { return this._ownerPubkey; }
+  get client() { return this._client; }
+
+  // --------------------------------------------------------------------------
+  // Agent identity and status
+  // --------------------------------------------------------------------------
+
+  /** Check this agent's permissions and status. */
+  async getPermissions() {
+    return this._client.validateAgent(this.publicKey, this._ownerPubkey);
+  }
+
+  /** Get the full agent registry for the owner. */
+  async getRegistry() {
+    return this._client.getAgentRegistry(this._ownerPubkey);
+  }
+
+  /** Send a heartbeat proving this agent is alive. */
+  async heartbeat(opts = {}) {
+    return this._client.sendInstruction(
+      this._keypair,
+      Instructions.agentHeartbeat(
+        this.publicKey,
+        opts.modelHash || '',
+        opts.activeTasks || 0,
+        opts.capacity || 10,
+        opts.status || 'online',
+      )
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Delegated operations (runs as owner via AgentExecute)
+  // --------------------------------------------------------------------------
+
+  /** Execute any instruction as the owner (goes through agent guardrails). */
+  async execute(innerInstructionData) {
+    const agentExecIx = Instructions.agentExecute(this._ownerPubkey, innerInstructionData);
+    return this._client.sendInstruction(this._keypair, agentExecIx);
+  }
+
+  /** Transfer XRS from owner's balance. */
+  async transferXrs(to, amountXrs) {
+    const lamports = Math.round(amountXrs * LAMPORTS_PER_XRS);
+    const inner = Instructions.nativeTransfer(this._ownerPubkey, to, lamports);
+    return this.execute(inner);
+  }
+
+  /** Swap tokens on a DEX pool (uses binary encoding). */
+  async swapTokens(poolId, tokenIn, amountIn, minAmountOut) {
+    let method = 'swap_a_to_b';
+    try {
+      const pool = await this._client.getContract(poolId);
+      if (pool && pool.state) {
+        const state = pool.state.Swap || pool.state;
+        if (state.token_b === tokenIn) method = 'swap_b_to_a';
+      }
+    } catch (e) { /* default */ }
+    const inner = encodeSwapCall(poolId, method, amountIn, minAmountOut);
+    return this.execute(inner);
+  }
+
+  /** Wrap XRS for DEX trading. */
+  async wrapXrs(amountXrs) {
+    return this.execute(Instructions.wrapXrs(Math.round(amountXrs * LAMPORTS_PER_XRS)));
+  }
+
+  /** Unwrap XRS from DEX. */
+  async unwrapXrs(amountXrs) {
+    return this.execute(Instructions.unwrapXrs(Math.round(amountXrs * LAMPORTS_PER_XRS)));
+  }
+
+  /** Call any contract method. */
+  async callContract(contractId, method, args) {
+    return this.execute(Instructions.contractCall(contractId, method, args));
+  }
+
+  /** Buy on a launchpad. */
+  async buyOnLaunchpad(launchpadId, xrsAmount, minTokensOut) {
+    return this.execute(Instructions.contractCall(launchpadId, 'buy_tokens', {
+      xrs_amount: xrsAmount, min_tokens_out: minTokensOut,
+    }));
+  }
+
+  // --------------------------------------------------------------------------
+  // Task economy
+  // --------------------------------------------------------------------------
+
+  /** Find tasks matching criteria. */
+  async findTasks(filters = {}) {
+    const tasks = await this._client.getTasks();
+    if (!tasks.data) return [];
+    return tasks.data.filter(t => {
+      if (filters.category && t.required_category !== filters.category) return false;
+      if (filters.minReward && t.reward < filters.minReward) return false;
+      return true;
+    });
+  }
+
+  /** Claim a task. */
+  async claimTask(taskId) {
+    return this._client.sendInstruction(
+      this._keypair,
+      Instructions.claimTask(taskId, this.publicKey),
+    );
+  }
+
+  /** Submit proof of task completion. */
+  async completeTask(taskId, proof) {
+    return this._client.sendInstruction(
+      this._keypair,
+      Instructions.resolveTask(taskId, 'complete', proof),
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Inter-agent communication
+  // --------------------------------------------------------------------------
+
+  /** Send a message to another agent. */
+  async sendMessage(toIdentity, messageType, payload, replyTo) {
+    return this._client.sendInstruction(
+      this._keypair,
+      Instructions.agentMessage(toIdentity, messageType, payload, replyTo),
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Agent planning (uses /agent/plan endpoint)
+  // --------------------------------------------------------------------------
+
+  /** Plan a transfer and get instruction data + balance check. */
+  async planTransfer(to, amountXrs) {
+    return this._client.agentPlan({ action: 'transfer', from: this._ownerPubkey, to, amount_xrs: amountXrs });
+  }
+
+  /** Plan a swap and get a quote. */
+  async planSwap(poolId, tokenIn, amountIn, slippagePct) {
+    return this._client.agentPlan({ action: 'swap', pool_id: poolId, token_in: tokenIn, amount_in: amountIn, slippage_pct: slippagePct || 5 });
+  }
+
+  /** Plan a launchpad buy and get a quote. */
+  async planBuy(launchpadId, xrsAmount, slippagePct) {
+    return this._client.agentPlan({ action: 'buy_launchpad', launchpad_id: launchpadId, xrs_amount: xrsAmount, slippage_pct: slippagePct || 5 });
+  }
+
+  // --------------------------------------------------------------------------
+  // Read-only queries (convenience wrappers)
+  // --------------------------------------------------------------------------
+
+  async getBalance() { return this._client.getBalance(this._ownerPubkey); }
+  async getTokenAccounts() { return this._client.getTokenAccounts(this._ownerPubkey); }
+  async getCapabilities() { return this._client.getCapabilities(); }
+  async searchCapabilities(params) { return this._client.searchCapabilities(params); }
+}
+
+// ============================================================================
 // EXPORTS
 // ============================================================================
 
@@ -1467,9 +2229,15 @@ module.exports = {
   // dApp adapter (browser, wallet-connected)
   XerisDApp,
 
+  // AI Agent class
+  XerisAgent,
+
   // Instruction building
   Instructions,
   Variant,
+
+  // Swap helper (binary encoding for DEX)
+  encodeSwapCall,
 
   // Test vectors
   TestVectors,
