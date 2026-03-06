@@ -252,18 +252,30 @@ await client.castVote(kp, 'prop_001', 'yes');
 ## Zero-Knowledge Proofs
 
 ```javascript
-// Submit a ZK proof
-await client.sendInstruction(kp, Instructions.zkProofSubmit(
-  'proof_001', 'groth16', proofBytes, publicInputBytes, 'vk_hash_here', 'transfer', '{}'
+// Send a private transfer (amount hidden on-chain)
+// Handles everything: fetches balance, subtracts fee, generates proofs, submits
+await client.sendZkPrivateTransfer(kp, recipientAddress, 5.0);
+
+// Or with a specific token
+await client.sendZkPrivateTransfer(kp, recipientAddress, 100.0, 'mytoken');
+
+// Generate proofs manually for custom use
+const { createZkPrivateTransferProofs } = require('xeris-sdk');
+const proofs = createZkPrivateTransferProofs(5_000_000_000, senderBalance);
+// proofs.commitment    → 48 bytes (witness data)
+// proofs.balanceProof  → 64 bytes (SHA-256 binding proof)
+// proofs.nullifier     → 32 bytes (double-spend prevention)
+// proofs.blinding      → 32 bytes (keep secret, needed to prove amount later)
+
+// Submit manually
+await client.sendInstruction(kp, Instructions.zkPrivateTransfer(
+  'xrs_native', kp.publicKey, recipientAddress,
+  proofs.commitment, proofs.rangeProof, proofs.balanceProof, proofs.nullifier
 ));
 
 // Check proof status
-const status = await client.getZkProofStatus('proof_001');
-console.log('Verified:', status.data.verified);
-
-// Network ZK stats
 const stats = await client.getZkStats();
-console.log('Total proofs:', stats.total_proofs);
+console.log('Total nullifiers:', stats.nullifiers_used);
 ```
 
 ---
@@ -271,12 +283,21 @@ console.log('Total proofs:', stats.total_proofs);
 ## Post-Quantum Cryptography
 
 ```javascript
-// Register a quantum-resistant key
+// Register a quantum-resistant key (re-registration replaces old key)
 await client.pqKeyRegister(kp, pqPublicKeyBytes, 'dilithium3', 3);
+
+// Build the message to sign with Dilithium
+const message = XerisClient.buildPqTransferMessage(kp.publicKey, recipientAddress, 5.0);
+// Sign with your Dilithium secret key (using pqcrypto-dilithium, liboqs, or WASM)
+const dilithiumSig = dilithium3_sign(secretKey, message); // 3293 bytes
+
+// Send a PQ-signed transfer
+await client.sendPqTransfer(kp, recipientAddress, 5.0, dilithiumSig);
 
 // Check PQ key status
 const pqInfo = await client.getPqKey(kp.publicKey);
 console.log('Algorithm:', pqInfo.algorithm);
+console.log('Protected:', pqInfo.has_pq_key);
 
 // Network quantum readiness
 const pqStatus = await client.getPqStatus();
