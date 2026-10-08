@@ -13,7 +13,7 @@ const { Transaction } = require('@solana/web3.js');
 const {
   XerisClient, Instructions, RpcError, XerisError, EncodingError, FeatureDisabledError, checks, fromPlan, signatureOf,
   assembleSignedTransaction, blockhashFromHex,
-  TESTNET_SEED, DEFAULT_RPC_PORT, DEFAULT_EXPLORER_PORT, MAINNET_HOST_ENV, LAMPORTS_PER_XRS,
+  TESTNET_SEED, DEFAULT_RPC_PORT, DEFAULT_EXPLORER_PORT, MAINNET_HOST_ENV, LAMPORTS_PER_XRS, ORDER_STORAGE_BOND,
 } = require('..');
 const H = require('./_helpers');
 
@@ -54,6 +54,20 @@ test('testnet() and explicit hosts derive the RPC and explorer URLs', () => {
   const e = new XerisClient(null, { fetch: async () => {}, rpcUrl: 'http://a:1', explorerUrl: 'http://b:2' });
   assert.equal(e.rpcUrl, 'http://a:1');
   assert.equal(e.explorerUrl, 'http://b:2');
+});
+
+test('the constructor, testnet() and mainnet() refuse unknown or non-object options', () => {
+  const f = async () => {};
+  assert.throws(() => new XerisClient('http://1.2.3.4', { fetch: f, timeout: 5 }),
+    (e) => e instanceof RangeError && /opts\.timeout: unknown option; use timeoutMs/.test(e.message));
+  assert.throws(() => new XerisClient('http://1.2.3.4', { fetch: f, rpcport: 9 }),
+    (e) => e instanceof RangeError && /opts\.rpcport: unknown option \(allowed: rpcPort, explorerPort, rpcUrl, explorerUrl, fetch, timeoutMs\)/.test(e.message));
+  assert.throws(() => XerisClient.testnet({ fetch: f, timeout: 5 }), RangeError);
+  assert.throws(() => XerisClient.mainnet('http://x', { fetch: f, explorerport: 1 }), RangeError);
+  for (const bad of [null, 5, 'x', []]) assert.throws(() => new XerisClient('http://1.2.3.4', bad), TypeError, String(bad));
+  const all = new XerisClient('http://1.2.3.4', { rpcPort: 1, explorerPort: 2, rpcUrl: 'http://a:3', explorerUrl: 'http://b:4', fetch: f, timeoutMs: 5 });
+  assert.equal(all.timeoutMs, 5);
+  assert.equal(all.rpcUrl, 'http://a:3');
 });
 
 test('mainnet() needs a host or the environment variable; nothing is hard-coded', () => {
@@ -598,4 +612,51 @@ test('QueryCapabilities and semantic-gate violations are refused before signing'
   await assert.rejects(c.sendInstruction(kp, Instructions.nativeTransfer(kp.publicKey, BOB, 0)), RangeError);
   await assert.rejects(c.sendInstruction(kp, Instructions.contractDeploy('c1', 'swap', 'not json')), RangeError);
   assert.equal(fetch.calls.filter((x) => x.url.endsWith('/submit')).length, 0);
+});
+
+test('callContract and sendInstruction refuse a protected protocol method (ledger.rs:2184-2320, 5833-5837)', async () => {
+  const kp = H.goldenKeypair();
+  const { c, fetch } = client();
+  const top = /ContractCall \S+ is a protected protocol method .*\(ledger\.rs:2184-2320, 5833-5837\)/;
+  for (const [id, m] of [['xeris_channels', 'close'], ['xeris_deals', 'settle'], ['xeris_tasks', 'claim'], ['xeris_governance', 'vote'], ['identity_abc', 'attest']]) {
+    await assert.rejects(c.callContract(kp, id, m, {}), (e) => e instanceof RangeError && top.test(e.message), `${id}.${m}`);
+  }
+  assert.equal(fetch.calls.length, 0);
+  await assert.rejects(c.sendInstruction(kp, Instructions.contractCall('xeris_channels', 'close', {})), (e) => e instanceof RangeError && top.test(e.message));
+  await assert.rejects(c.sendInstruction(kp, Instructions.contractCall('identity_x', 'attest', {})), (e) => e instanceof RangeError && top.test(e.message));
+  assert.equal(fetch.calls.filter((x) => x.url.endsWith('/submit')).length, 0);
+  await c.callContract(kp, 'xeris_channels', 'challenge_update', { channel_id: 'c' });
+  assert.deepEqual(submittedIx(lastPost(fetch)), Instructions.contractCall('xeris_channels', 'challenge_update', { channel_id: 'c' }));
+});
+
+test('conditionalOrder refuses inner instructions the order would not run, before any I/O', async () => {
+  const kp = H.goldenKeypair();
+  const { c, fetch } = client();
+  const place = (inner, locked = 10n ** 9n) => c.conditionalOrder(kp, 'o', 'slot_reached', 's', 1, inner, 1000, locked);
+  const noop = /innerInstruction: \w+ \(variant \d+\) does nothing when a conditional order fires; the node marks the order executed without running it \(ledger\.rs:9257-9272, 9301; token\.rs:1183-1199, 1333\)\. Allowed: TokenMint, TokenTransfer, TokenBurn, TokenCreate, ContractCall, TokenCreateRWA, RWAUpdateStatus, RWATransfer, NativeTransfer$/;
+  for (const inner of [
+    Instructions.wrapXrs(5),
+    Instructions.stake(kp.publicKey, 10n ** 12n),
+    Instructions.createDeal('d1', BOB, 10n ** 9n, 'terms'),
+    Instructions.cancelConditionalOrder('o0'),
+    Instructions.contractDeploy('cid', 'Swap', '{}'),
+  ]) {
+    await assert.rejects(place(inner), (e) => e instanceof RangeError && noop.test(e.message), inner.readUInt32LE(0).toString());
+  }
+  await assert.rejects(place(Instructions.contractCall('xeris_channels', 'close', {})),
+    (e) => e instanceof RangeError && /innerInstruction: nested ContractCall xeris_channels\.close is a protected protocol method .*\(ledger\.rs:2184-2320, 9163-9166\)/.test(e.message));
+  await assert.rejects(place(Instructions.contractCall('xeris_deals', 'settle', {})), /9163-9166/);
+  await assert.rejects(place(Instructions.nativeTransfer(kp.publicKey, BOB, 5_000_000_000n), 10_000_000),
+    (e) => e instanceof RangeError && /lockedAmount: 10000000 does not cover the inner NativeTransfer amount 5000000000; .*\(ledger\.rs:7008-7018\)/.test(e.message));
+  await assert.rejects(place(Instructions.nativeTransfer(kp.publicKey, BOB, 1), ORDER_STORAGE_BOND - 1), /below the storage bond/);
+  assert.equal(fetch.calls.length, 0);
+  for (const inner of [
+    Instructions.nativeTransfer(kp.publicKey, BOB, 5_000_000_000n),
+    Instructions.tokenTransfer('tok', kp.publicKey, BOB, 5),
+    Instructions.contractCall('pool', 'add_liquidity', { amount_a: 1 }),
+    Instructions.contractCall('xeris_channels', 'challenge_update', { channel_id: 'c' }),
+  ]) {
+    await place(inner, 5_000_000_000n);
+    assert.deepEqual(submittedIx(lastPost(fetch)), Instructions.conditionalOrder('o', 'slot_reached', 's', 1, inner, 1000, 5_000_000_000n));
+  }
 });

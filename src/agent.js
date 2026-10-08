@@ -24,8 +24,9 @@
  * `args` must be a JSON object; the method must be in
  * `DELEGATED_CALL_METHODS` (`add_liquidity` is budgeted through
  * `quote_add_liquidity`, `ledger.rs:6448-6459`); `contract_id` must not start
- * with `agent_registry_`; protected protocol methods, Launchpad contracts
- * (XWC-07) and RWA contracts (XWC-03) are rejected; `confirm`/`verify` fail
+ * with `agent_registry_`; protected protocol methods (`isProtectedContractCall`,
+ * refused here before signing), Launchpad contracts (XWC-07) and RWA
+ * contracts (XWC-03) are rejected; `confirm`/`verify` fail
  * closed. The AMM swap methods and launchpad trades are therefore not
  * reachable through delegation, and delegated Stake/Unstake execute as
  * no-ops that still consume budget (`token.rs:1183-1200`); the matching
@@ -371,7 +372,9 @@ class XerisAgent {
    * (`ledger.rs:6522, 6648-6655`); Stake/Unstake →
    * `FeatureDisabledError('agentStake')`; a ContractCall with non-object
    * args, a method outside `DELEGATED_CALL_METHODS` or an `agent_registry_`
-   * target → `FeatureDisabledError`/`XerisError`. Nested AgentExecute or
+   * target → `FeatureDisabledError`/`XerisError`/`RangeError`; a ContractCall
+   * to a method `isProtectedContractCall` seals → `RangeError`
+   * (`ledger.rs:6432-6435`). Nested AgentExecute or
    * ConditionalOrder is rejected at ingress (`ledger.rs:1439`).
    * @param {Buffer|Uint8Array} innerInstruction encoded inner instruction
    * @returns {Promise<SubmitResult>}

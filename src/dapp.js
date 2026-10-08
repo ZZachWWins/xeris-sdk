@@ -29,7 +29,9 @@
  */
 
 const { Buffer } = require('buffer');
-const { XerisClient, checks } = require('./client');
+const {
+  XerisClient, checks, onlyKeys, CLIENT_OPTION_KEYS,
+} = require('./client');
 const {
   assertInstructionSubmittable,
   buildTransaction,
@@ -54,6 +56,9 @@ const EVENTS = Object.freeze(['connect', 'disconnect', 'accountChanged']);
 
 /** Networks `opts.network` accepts; `'testnet'` is the fixed SDK default (blueprint §11.2). */
 const NETWORKS = Object.freeze(['testnet', 'mainnet']);
+
+/** Keys the constructor accepts: the `XerisClient` options plus `provider`, `host` and `network`. */
+const DAPP_OPTION_KEYS = Object.freeze([...CLIENT_OPTION_KEYS, 'provider', 'host', 'network']);
 
 // The two AMM methods whose `args` the dispatcher passes through as raw bytes
 // when the payload is exactly 16 bytes (ledger.rs:2367-2370; the engine reads
@@ -275,12 +280,14 @@ class XerisDApp {
    *   (`network.rs:282-300`) and requires `opts.host`/`opts.rpcUrl` or `provider.getRpcUrl()`.
    * @param {Function} [opts.fetch] `fetch` implementation (default `globalThis.fetch`).
    * @param {number} [opts.timeoutMs] Per-request timeout for the internal `XerisClient`.
-   * @throws {TypeError|RangeError|XerisError} on malformed options
+   * @throws {TypeError|RangeError|XerisError} on malformed options; `RangeError` for an unknown key
+   *   (a misspelt `network` would otherwise fall back to testnet)
    */
   constructor(opts = {}) {
     if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
       throw new TypeError(`XerisDApp: opts must be an object, got ${describe(opts)}`);
     }
+    onlyKeys(opts, DAPP_OPTION_KEYS, 'opts', { timeout: 'timeoutMs' });
     const network = opts.network === undefined ? 'testnet' : opts.network;
     if (!NETWORKS.includes(network)) {
       throw new RangeError(`opts.network: expected one of ${NETWORKS.map((n) => `'${n}'`).join(', ')}, got ${describe(opts.network)}`);
@@ -419,6 +426,7 @@ class XerisDApp {
     if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
       throw new TypeError(`connect: opts must be an object, got ${describe(opts)}`);
     }
+    onlyKeys(opts, ['onlyIfTrusted'], 'opts');
     const onlyIfTrusted = opts.onlyIfTrusted === undefined ? false : opts.onlyIfTrusted;
     if (typeof onlyIfTrusted !== 'boolean') {
       throw new TypeError(`opts.onlyIfTrusted: expected a boolean, got ${describe(opts.onlyIfTrusted)}`);

@@ -214,3 +214,35 @@ test('contract JSON args from the dApp carry bigint exactly and refuse undefined
   assert.ok(data.toString('utf8').endsWith('{"xrs_amount":50000000000,"min_tokens_out":15488583466903808}'));
   await assert.rejects(dapp.callContract('lp', 'buy_tokens', { xrs_amount: 1, min_tokens_out: undefined }), TypeError);
 });
+
+test('the constructor refuses unknown or non-object options', () => {
+  assert.throws(() => new XerisDApp({ netwrok: 'mainnet' }), (e) => e instanceof RangeError && /opts\.netwrok: unknown option \(allowed: rpcPort, explorerPort, rpcUrl, explorerUrl, fetch, timeoutMs, provider, host, network\)/.test(e.message));
+  assert.throws(() => new XerisDApp({ timeout: 5, host: 'http://h' }), (e) => e instanceof RangeError && /use timeoutMs/.test(e.message));
+  for (const bad of [null, 5, []]) assert.throws(() => new XerisDApp(bad), TypeError, String(bad));
+  const dapp = new XerisDApp({
+    provider: provider(signedWeb3), host: 'http://h', network: 'mainnet', rpcPort: 1, explorerPort: 2, fetch: fetchMock(), timeoutMs: 5,
+  });
+  assert.equal(dapp.client.rpcUrl, 'http://h:1');
+});
+
+test('a ContractCall to a protected protocol method is refused before the wallet is asked', async () => {
+  const fetch = fetchMock();
+  let asked = 0;
+  const dapp = new XerisDApp({ provider: provider((tx, kp) => { asked += 1; return signedWeb3(tx, kp); }), fetch });
+  await dapp.connect();
+  await assert.rejects(dapp.callContract('xeris_channels', 'close', { channel_id: 'c' }), (e) => e instanceof RangeError && /protected protocol method .*ledger\.rs:2184-2320, 5833-5837/.test(e.message));
+  await assert.rejects(dapp.sendInstruction(Instructions.conditionalOrder('o', 'slot_reached', 's', 1, Instructions.wrapXrs(1), 1000, 10n ** 9n)), /does nothing when the order fires/);
+  assert.equal(asked, 0);
+  assert.equal(fetch.calls.filter((c) => c.url.endsWith('/submit')).length, 0);
+});
+
+test('connect refuses unknown option keys before asking the wallet', async () => {
+  let asked = 0;
+  const p = provider(signedWeb3);
+  const realConnect = p.connect;
+  p.connect = async (...a) => { asked++; return realConnect.apply(p, a); };
+  const dapp = new XerisDApp({ provider: p, fetch: fetchMock() });
+  await assert.rejects(dapp.connect({ onlyiftrusted: true }), RangeError);
+  assert.equal(asked, 0);
+  assert.deepEqual(await dapp.connect({ onlyIfTrusted: false }), { publicKey: H.GOLDEN_PUBKEY });
+});

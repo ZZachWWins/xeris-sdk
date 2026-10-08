@@ -52,6 +52,9 @@ const {
   AGENT_INNER_VARIANTS,
   CONDITION_TYPES,
   MAX_CONDITIONAL_INNER_BYTES,
+  CONDITIONAL_INNER_VARIANTS,
+  ORDER_STORAGE_BOND,
+  PROTECTED_CONTRACT_CALLS,
 } = require('./constants.js');
 const { XerisKeypair, isCanonicalPubkey } = require('./keypair.js');
 const { decodeInstruction, tryDecodeInstruction, VARIANT_NAMES } = require('./instructions/index.js');
@@ -100,6 +103,58 @@ for (const [v, key] of Object.entries(DISABLED_VARIANT_FEATURES)) {
   if (!Object.prototype.hasOwnProperty.call(DISABLED_FEATURES, key)) {
     throw new Error(`transaction.js: DISABLED_VARIANT_FEATURES maps ${v} to '${key}', which is not a DISABLED_FEATURES key`);
   }
+}
+for (const v of CONDITIONAL_INNER_VARIANTS) {
+  if (!Number.isInteger(v) || v < 0 || v >= INSTRUCTION_COUNT || DISABLED_VARIANTS.includes(v)) {
+    throw new Error(`transaction.js: CONDITIONAL_INNER_VARIANTS contains ${v}, which is not an enabled variant index 0..${INSTRUCTION_COUNT - 1}`);
+  }
+}
+
+/**
+ * The node's `is_protected_contract_call` (`ledger.rs:2184-2320`): `true` when
+ * a generic ContractCall to `method` on `contractId` is refused because the
+ * method is reserved for its dedicated instruction. A pure function of the two
+ * strings, so it needs no chain state. A contract id that starts with a key of
+ * `PROTECTED_CONTRACT_CALLS.prefixes` (`agent_registry_`, `identity_`) is
+ * sealed for exactly that prefix's methods; any other id is looked up in
+ * `PROTECTED_CONTRACT_CALLS.contracts`. The node checks it after charging the
+ * fee for a top-level ContractCall (`ledger.rs:5833-5837`), an AgentExecute
+ * inner call (`ledger.rs:6432-6435`) and a ConditionalOrder inner call when the
+ * order fires (`ledger.rs:9163-9166`); `buildTransaction` refuses all three.
+ * @param {string} contractId
+ * @param {string} method
+ * @returns {boolean}
+ * @throws {TypeError} When either argument is not a string.
+ */
+function isProtectedContractCall(contractId, method) {
+  if (typeof contractId !== 'string') throw new TypeError(`contractId: expected a string, got ${describe(contractId)}`);
+  if (typeof method !== 'string') throw new TypeError(`method: expected a string, got ${describe(method)}`);
+  for (const [prefix, methods] of Object.entries(PROTECTED_CONTRACT_CALLS.prefixes)) {
+    if (contractId.startsWith(prefix)) return methods.includes(method);
+  }
+  const table = PROTECTED_CONTRACT_CALLS.contracts;
+  return Object.prototype.hasOwnProperty.call(table, contractId) && table[contractId].includes(method);
+}
+
+/**
+ * The block-level problem with a ContractCall to a method
+ * `isProtectedContractCall` seals, or `null`.
+ * @param {string} contractId
+ * @param {string} method
+ * @param {number} carrier 4 for a top-level ContractCall, 17 for an AgentExecute
+ *   inner call, 23 for a ConditionalOrder inner call.
+ * @returns {{message: string, cite: string, inBlock: true}|null}
+ */
+function protectedCallProblem(contractId, method, carrier) {
+  if (!isProtectedContractCall(contractId, method)) return null;
+  const what = `${contractId}.${method} is a protected protocol method that only its dedicated instruction may call`;
+  if (carrier === 17) {
+    return { message: `nested ContractCall ${what}; the block skips the AgentExecute after charging the fee`, cite: 'ledger.rs:2184-2320, 6432-6435', inBlock: true };
+  }
+  if (carrier === 23) {
+    return { message: `nested ContractCall ${what}; the order is cancelled when it fires`, cite: 'ledger.rs:2184-2320, 9163-9166', inBlock: true };
+  }
+  return { message: `ContractCall ${what}; the block skips it after charging the fee`, cite: 'ledger.rs:2184-2320, 5833-5837', inBlock: true };
 }
 
 /**
@@ -459,9 +514,9 @@ function semanticProblem(data, signer) {
 
 /**
  * `validate_tx_semantics` for one decoded instruction, plus the stateless
- * block checks on AgentExecute / ConditionalOrder inner instructions and the
- * JSON checks on ContractCall args and ContractDeploy params; see
- * `semanticProblem`.
+ * block checks on AgentExecute / ConditionalOrder inner instructions, the
+ * protected-method deny list and JSON checks on ContractCall, and the JSON
+ * check on ContractDeploy params; see `semanticProblem`.
  * @param {import('./instructions/index.js').DecodedInstruction} d
  * @param {string} signer
  * @returns {{message: string, cite: string, inBlock?: boolean}|null}
@@ -490,6 +545,9 @@ function statelessProblem(d, signer) {
   }
   if (variant === 17 || variant === 23) return wrappedProblem(d, signer);
   if (variant === 4) {
+    // The deny list is checked first, after the fee is charged (ledger.rs:5833-5837).
+    const sealed = protectedCallProblem(f.contract_id, f.method, 4);
+    if (sealed !== null) return sealed;
     // contract_call_args (ledger.rs:2367-2371): 16 raw bytes pass through only for the
     // two Swap methods; everything else must be a JSON object serde_json accepts, or the
     // call is rejected in the block after the fee is charged (ledger.rs:2359-2365, 5884-5891).
@@ -522,9 +580,18 @@ function statelessProblem(d, signer) {
  * - the inner instruction decodes (`ledger.rs:6399-6405`, `6923-6927`);
  * - ConditionalOrder inner instruction at most `MAX_CONDITIONAL_INNER_BYTES`
  *   (`ledger.rs:6941-6944`);
+ * - ConditionalOrder `locked_amount` at least `ORDER_STORAGE_BOND`
+ *   (`ledger.rs:6998-7002`) and, for an inner NativeTransfer, at least its
+ *   amount (`ledger.rs:7008-7018`);
+ * - ConditionalOrder inner variant in `CONDITIONAL_INNER_VARIANTS`; any other
+ *   is marked executed without running when the order fires
+ *   (`ledger.rs:9257-9272, 9301`; `token.rs:1183-1199, 1333`);
  * - AgentExecute inner variant in `AGENT_INNER_VARIANTS` (`ledger.rs:6478-6484`);
  * - AgentExecute inner ContractCall not targeting an `agent_registry_`
  *   contract (`ledger.rs:6428-6431`);
+ * - inner ContractCall not to a protected protocol method
+ *   (`isProtectedContractCall`; AgentExecute `ledger.rs:6432-6435`,
+ *   ConditionalOrder `ledger.rs:9163-9166`);
  * - inner ContractCall args (see `statelessProblem`);
  * - inner TokenTransfer/TokenBurn `from` (and, for ConditionalOrder, also
  *   TokenCreate/TokenCreateRWA `mint_authority` and RWATransfer `from`) equal
@@ -584,6 +651,27 @@ function wrappedProblem(d, signer) {
       inBlock: true,
     };
   }
+  if (variant === 23 && f.locked_amount < BigInt(ORDER_STORAGE_BOND)) {
+    return {
+      message: `ConditionalOrder locked_amount ${f.locked_amount} is below the storage bond ${ORDER_STORAGE_BOND} lamports; ${skipped}`,
+      cite: 'ledger.rs:6998-7002',
+      inBlock: true,
+    };
+  }
+  if (variant === 23 && inner.variant === 11 && f.locked_amount < inner.fields.amount) {
+    return {
+      message: `ConditionalOrder locked_amount ${f.locked_amount} does not cover the inner NativeTransfer amount ${inner.fields.amount}; ${skipped}`,
+      cite: 'ledger.rs:7008-7018',
+      inBlock: true,
+    };
+  }
+  if (variant === 23 && !CONDITIONAL_INNER_VARIANTS.includes(inner.variant)) {
+    return {
+      message: `ConditionalOrder inner ${inner.name} (variant ${inner.variant}) does nothing when the order fires: the node marks the order executed without running it (only ${CONDITIONAL_INNER_VARIANTS.map((v) => VARIANT_NAMES[v]).join(', ')} run)`,
+      cite: 'ledger.rs:9257-9272, 9301; token.rs:1183-1199, 1333',
+      inBlock: true,
+    };
+  }
   if (variant === 17 && !AGENT_INNER_VARIANTS.includes(inner.variant)) {
     return {
       message: `AgentExecute inner ${inner.name} (variant ${inner.variant}) is not in the delegation allow-list (${AGENT_INNER_VARIANTS.map((v) => VARIANT_NAMES[v]).join(', ')}); ${skipped}`,
@@ -600,6 +688,9 @@ function wrappedProblem(d, signer) {
     };
   }
   if (inner.variant === 4) {
+    // Both paths apply the deny list before reading the args (ledger.rs:6432-6435, 9163-9166).
+    const sealed = protectedCallProblem(g.contract_id, g.method, variant);
+    if (sealed !== null) return sealed;
     // AgentExecute: the inner args must parse as a JSON object, with no binary-swap
     // exemption, or the block skips it after the fee (ledger.rs:6436-6442, 5516-5546).
     // ConditionalOrder: the inner call goes through contract_call_args when the order
@@ -683,6 +774,11 @@ function jsonObjectProblem(bytes, label) {
  *   ConditionalOrder.
  * It also refuses payloads the node accepts at ingress but rejects in the
  * block after charging the fee (`ledger.rs:5516-5546`):
+ * - a ContractCall to a protected protocol method (`isProtectedContractCall`,
+ *   `ledger.rs:2184-2320`), at the top level (`ledger.rs:5833-5837`) and as
+ *   the inner instruction of AgentExecute (`ledger.rs:6432-6435`) or
+ *   ConditionalOrder (the order is cancelled when it fires,
+ *   `ledger.rs:9163-9166`);
  * - ContractCall args that are not a JSON object serde_json can parse (except
  *   the 16-byte swap payload; `ledger.rs:2359-2371`), at the top level and as
  *   the inner instruction of AgentExecute (no swap exception there,
@@ -696,6 +792,11 @@ function jsonObjectProblem(bytes, label) {
  *   inner instruction above `MAX_CONDITIONAL_INNER_BYTES` (`ledger.rs:6941-6944`),
  *   or an AgentExecute inner ContractCall to an `agent_registry_` contract
  *   (`ledger.rs:6428-6431`);
+ * - a ConditionalOrder `locked_amount` below `ORDER_STORAGE_BOND`
+ *   (`ledger.rs:6998-7002`) or below the amount of its inner NativeTransfer
+ *   (`ledger.rs:7008-7018`), and a ConditionalOrder inner variant outside
+ *   `CONDITIONAL_INNER_VARIANTS`, which the order marks executed without
+ *   running it (`ledger.rs:9257-9272, 9301`; `token.rs:1183-1199, 1333`);
  * - an actor field that is not the signer: TokenTransfer / TokenBurn /
  *   RWATransfer / NativeTransfer `from`, TokenCreate / TokenCreateRWA
  *   `mint_authority`, Stake/Unstake `pubkey`, CreateIdentity / RegisterModel /
@@ -1165,6 +1266,8 @@ function parseSubmitResponse(body, route, httpStatus) {
 }
 
 module.exports = {
+  isProtectedContractCall,
+  protectedCallProblem,
   blockhashFromHex,
   assertInstructionSubmittable,
   buildTransaction,

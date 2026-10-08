@@ -42,6 +42,7 @@ const {
   submitBody,
   parseSubmitResponse,
   signatureOf,
+  protectedCallProblem,
 } = require('./transaction');
 const {
   Instructions,
@@ -104,6 +105,7 @@ const {
   MIN_DEAL_DISPUTE_BOND,
   ORDER_STORAGE_BOND,
   MAX_CONDITIONAL_INNER_BYTES,
+  CONDITIONAL_INNER_VARIANTS,
   MIN_ORACLE_STAKE_LAMPORTS,
   MIN_VOTING_PERIOD_SLOTS,
   MAX_VOTING_PERIOD_SLOTS,
@@ -887,10 +889,12 @@ const checks = Object.freeze({
    * JSON object serde_json parses (no invalid UTF-8, lone surrogate or
    * out-of-range number; `ledger.rs:6436-6442`; a 16-byte swap payload →
    * `'agentSwap'`), the method must be in `DELEGATED_CALL_METHODS`
-   * (`ledger.rs:2138-2175`, else `'agentDelegatedMethod'`) and the target may
-   * not be an `agent_registry_` contract (`ledger.rs:6428-6431`).
-   * Launchpad/RWA targets and protected protocol methods are also rejected by
-   * the node (`ledger.rs:6554-6561, 2184-2240`) but need state to recognise.
+   * (`ledger.rs:2138-2175`, else `'agentDelegatedMethod'`), the target may
+   * not be an `agent_registry_` contract (`ledger.rs:6428-6431`) and the
+   * method may not be a protected protocol method (`isProtectedContractCall`,
+   * a pure function of contract id and method; `ledger.rs:2184-2320,
+   * 6432-6435`). Launchpad/RWA targets are also rejected by the node
+   * (`ledger.rs:6554-6561`) but need state to recognise.
    * @param {Buffer|Uint8Array} innerData Encoded inner instruction.
    * @param {string} ownerPubkey The AgentExecute `owner_pubkey` the inner instruction runs as.
    * @throws {TypeError|EncodingError|RangeError|FeatureDisabledError|XerisError}
@@ -929,6 +933,8 @@ const checks = Object.freeze({
       if (contractId.startsWith('agent_registry_')) {
         throw new RangeError(`innerInstruction: delegated calls to agent registries are rejected by the node (contract '${contractId}', ledger.rs:6428-6431)`);
       }
+      const sealed = protectedCallProblem(contractId, method, Variant.AgentExecute);
+      if (sealed !== null) throw new RangeError(`innerInstruction: ${sealed.message} (${sealed.cite})`);
       // serde_json::from_slice::<Value> (ledger.rs:6436-6442) refuses invalid UTF-8,
       // lone surrogates and out-of-range numbers; parseJson with forNode mirrors it.
       let parsed;
@@ -980,6 +986,9 @@ const checks = Object.freeze({
  * @property {typeof fetch} [fetch] `fetch` implementation (default `globalThis.fetch`).
  * @property {number} [timeoutMs] Per-request timeout in milliseconds (default 30000).
  */
+
+/** The `ClientOptions` keys; the constructor refuses any other key. */
+const CLIENT_OPTION_KEYS = Object.freeze(['rpcPort', 'explorerPort', 'rpcUrl', 'explorerUrl', 'fetch', 'timeoutMs']);
 
 /**
  * `getLatestBlockhashInfo` result (JSON-RPC `getLatestBlockhash`, `explorer.rs:1489-1500`).
@@ -1033,7 +1042,8 @@ class XerisClient {
    *   only when both `opts.rpcUrl` and `opts.explorerUrl` are given.
    * @param {ClientOptions} [opts={}]
    * @throws {TypeError} For a non-object `opts` or wrongly typed option.
-   * @throws {RangeError} For a port outside 1..65535 or a non-positive `timeoutMs`.
+   * @throws {RangeError} For an unknown option key (`onlyKeys`), a port outside 1..65535 or a
+   *   non-positive `timeoutMs`.
    * @throws {XerisError} code `'config'` for a malformed host/URL, a missing
    *   `fetch`, or a `null` host without both URL overrides.
    */
@@ -1041,6 +1051,7 @@ class XerisClient {
     if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
       throw new TypeError(`opts: expected an object, got ${describe(opts)}`);
     }
+    onlyKeys(opts, CLIENT_OPTION_KEYS, 'opts', { timeout: 'timeoutMs' });
     const rpcPort = opts.rpcPort === undefined ? DEFAULT_RPC_PORT : port(opts.rpcPort, 'opts.rpcPort');
     const explorerPort = opts.explorerPort === undefined ? DEFAULT_EXPLORER_PORT : port(opts.explorerPort, 'opts.explorerPort');
     const rpcOverride = opts.rpcUrl === undefined ? null : baseUrl(opts.rpcUrl, 'opts.rpcUrl', { allowPort: true, allowPath: true });
@@ -1820,7 +1831,13 @@ class XerisClient {
    * them and the node reads a missing slippage field as 0
    * (`contracts.rs:2849-2850, 2946-2947`).
    * The node injects `current_slot` into JSON args (`ledger.rs:2360-2365`).
-   * Protocol contract ids such as `xeris_channels` are valid call targets.
+   * A method the node reserves for its dedicated instruction
+   * (`isProtectedContractCall`, `PROTECTED_CONTRACT_CALLS`, `ledger.rs:2184-2320`;
+   * for example `xeris_channels` `open` / `close` / `force_close`, every
+   * `xeris_deals` mutator, `xeris_governance` `vote`) throws `RangeError` before
+   * any I/O: the block skips it after charging the fee (`ledger.rs:5833-5837`).
+   * Other methods of protocol contracts, such as `xeris_channels`
+   * `challenge_update` / `finalize_dispute`, are valid targets.
    * @param {XerisKeypair} keypair Caller.
    * @param {string} contractId
    * @param {string} method
@@ -1833,6 +1850,8 @@ class XerisClient {
     requireKeypair(keypair);
     assertString(contractId, 'contractId');
     assertString(method, 'method');
+    const sealed = protectedCallProblem(contractId, method, Variant.ContractCall);
+    if (sealed !== null) throw new RangeError(`${sealed.message} (${sealed.cite})`);
     let payload;
     if (SWAP_METHODS.includes(method)) {
       const bytes = toBytes(args, 'args');
@@ -2150,16 +2169,25 @@ class XerisClient {
   }
 
   /**
-   * ConditionalOrder (variant 23): escrows `lockedAmount` and executes
-   * `innerInstruction` when the condition holds (`ledger.rs:6916-7122`).
+   * ConditionalOrder (variant 23): escrows `lockedAmount` and, when the
+   * condition holds, runs `innerInstruction` as the signer
+   * (`ledger.rs:6916-7122, 9097-9301`). Only the variants in
+   * `CONDITIONAL_INNER_VARIANTS` run: NativeTransfer, ContractCall, and the
+   * token processor's TokenMint, TokenTransfer, TokenBurn, TokenCreate,
+   * TokenCreateRWA, RWAUpdateStatus and RWATransfer. Any other inner variant
+   * would be marked executed without running (`ledger.rs:9257-9272, 9301`;
+   * `token.rs:1183-1199, 1333`), so it throws `RangeError`.
    * `conditionType` ∈ `CONDITION_TYPES`; the inner instruction is at most
    * `MAX_CONDITIONAL_INNER_BYTES` (2048, `ledger.rs:6941-6944`), must decode
    * as a `XerisInstruction` (`ledger.rs:6923-6927`), pass
    * `assertInstructionSubmittable`, and not be a nested
-   * AgentExecute/ConditionalOrder (`ledger.rs:1439`); an inner token
-   * instruction runs as the signer when the order fires, so its `from` /
+   * AgentExecute/ConditionalOrder (`ledger.rs:1439`); an inner ContractCall
+   * may not be a protected protocol method (`isProtectedContractCall`; the
+   * order would be cancelled when it fires, `ledger.rs:9163-9166`); an inner
+   * token instruction runs as the signer when the order fires, so its `from` /
    * `mint_authority` must be the signer (checked by `buildTransaction`);
-   * `lockedAmount` ≥ `ORDER_STORAGE_BOND` (`ledger.rs:6998-7002`);
+   * `lockedAmount` ≥ `ORDER_STORAGE_BOND` (`ledger.rs:6998-7002`) and, for an
+   * inner NativeTransfer, ≥ its amount (`ledger.rs:7008-7018`);
    * `expiresAtSlot` must be in the future and within `MAX_ORDER_LIFETIME_SLOTS`.
    * @param {XerisKeypair} keypair Order owner.
    * @param {string} orderId
@@ -2191,8 +2219,20 @@ class XerisClient {
     if (innerVariant === Variant.AgentExecute || innerVariant === Variant.ConditionalOrder) {
       throw new RangeError(`innerInstruction: nested ${VARIANT_NAMES[innerVariant]} is rejected at ingress (ledger.rs:1439)`);
     }
-    if (normalizeU64(lockedAmount, 'lockedAmount') < BigInt(ORDER_STORAGE_BOND)) {
+    if (!CONDITIONAL_INNER_VARIANTS.includes(innerVariant)) {
+      throw new RangeError(`innerInstruction: ${VARIANT_NAMES[innerVariant]} (variant ${innerVariant}) does nothing when a conditional order fires; the node marks the order executed without running it (ledger.rs:9257-9272, 9301; token.rs:1183-1199, 1333). Allowed: ${CONDITIONAL_INNER_VARIANTS.map((v) => VARIANT_NAMES[v]).join(', ')}`);
+    }
+    const innerFields = decoded.value.fields;
+    if (innerVariant === Variant.ContractCall) {
+      const sealed = protectedCallProblem(innerFields.contract_id, innerFields.method, Variant.ConditionalOrder);
+      if (sealed !== null) throw new RangeError(`innerInstruction: ${sealed.message} (${sealed.cite})`);
+    }
+    const locked = normalizeU64(lockedAmount, 'lockedAmount');
+    if (locked < BigInt(ORDER_STORAGE_BOND)) {
       throw new RangeError(`lockedAmount: below the storage bond ${ORDER_STORAGE_BOND} lamports (ledger.rs:6998-7002)`);
+    }
+    if (innerVariant === Variant.NativeTransfer && locked < innerFields.amount) {
+      throw new RangeError(`lockedAmount: ${locked} does not cover the inner NativeTransfer amount ${innerFields.amount}; the block skips the order after charging the fee (ledger.rs:7008-7018)`);
     }
     return this.sendInstruction(keypair, Instructions.conditionalOrder(orderId, conditionType, conditionSource, conditionThreshold, inner, expiresAtSlot, lockedAmount));
   }
@@ -3888,4 +3928,4 @@ class XerisClient {
   }
 }
 
-module.exports = { XerisClient, checks };
+module.exports = { XerisClient, checks, onlyKeys, CLIENT_OPTION_KEYS };

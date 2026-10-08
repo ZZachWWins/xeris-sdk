@@ -46,6 +46,15 @@ test('fromJsonFile / saveToFile use the node wallet format (JSON array of 64 int
     const obj = path.join(dir, 'obj.json');
     fs.writeFileSync(obj, JSON.stringify({ secretKey: kp.toJsonBytes() }));
     assert.throws(() => XerisKeypair.fromJsonFile(obj), EncodingError);
+    // Options: only `mode`, in an object; anything else throws and writes nothing.
+    const other = path.join(dir, 'other.json');
+    assert.throws(() => kp.saveToFile(other, 0o644), TypeError);
+    assert.throws(() => kp.saveToFile(other, null), TypeError);
+    assert.throws(() => kp.saveToFile(other, []), TypeError);
+    assert.throws(() => kp.saveToFile(other, { Mode: 0o644 }), (e) => e instanceof RangeError && /opts\.Mode: unknown option \(allowed: mode\)/.test(e.message));
+    assert.equal(fs.existsSync(other), false);
+    kp.saveToFile(other, { mode: 0o640 });
+    assert.equal(fs.statSync(other).mode & 0o777, 0o640);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

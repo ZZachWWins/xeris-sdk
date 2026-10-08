@@ -20,7 +20,8 @@
  * `ledger.rs:8669-8685`, ZkIdentityProof 49 `ledger.rs:8687-8697`,
  * PqSignedTransfer 52 `ledger.rs:8809-8828`), `disabledFeature`, `submitBody`,
  * `serializedFromWalletResult`, `concat`, `toBytes`, `assertString`,
- * `isPlainJsonObject`, `assertJsonObjectText`.
+ * `isPlainJsonObject`, `assertJsonObjectText`, `protectedCallProblem`, `onlyKeys`,
+ * `CLIENT_OPTION_KEYS`.
  *
  * The export list is fixed; `test/exports.test.js` asserts it and nothing more.
  */
@@ -107,6 +108,7 @@ exports.DISABLED_FEATURES = errors.DISABLED_FEATURES;
 
 // -- Node business rules (pure functions used by the three classes) --------
 exports.checks = client.checks;
+exports.isProtectedContractCall = transaction.isProtectedContractCall;
 
 // -- Reference vectors -----------------------------------------------------
 exports.TestVectors = vectors.TestVectors;
@@ -183,6 +185,7 @@ exports.RESERVED_CONTRACT_ID_PREFIXES = constants.RESERVED_CONTRACT_ID_PREFIXES;
 exports.RESERVED_CONTRACT_ID_SUFFIXES = constants.RESERVED_CONTRACT_ID_SUFFIXES;
 exports.CONTRACT_ID_PATTERN = constants.CONTRACT_ID_PATTERN;
 exports.PROTOCOL_CONTRACT_IDS = constants.PROTOCOL_CONTRACT_IDS;
+exports.PROTECTED_CONTRACT_CALLS = constants.PROTECTED_CONTRACT_CALLS;
 exports.MIN_DEAL_DISPUTE_BOND = constants.MIN_DEAL_DISPUTE_BOND;
 exports.DEAL_TIMEOUT_SLOTS = constants.DEAL_TIMEOUT_SLOTS;
 exports.DISPUTE_CHALLENGE_PERIOD_SLOTS = constants.DISPUTE_CHALLENGE_PERIOD_SLOTS;
@@ -191,6 +194,7 @@ exports.MAX_TASK_LIFETIME_SLOTS = constants.MAX_TASK_LIFETIME_SLOTS;
 exports.ORDER_STORAGE_BOND = constants.ORDER_STORAGE_BOND;
 exports.MAX_ORDER_LIFETIME_SLOTS = constants.MAX_ORDER_LIFETIME_SLOTS;
 exports.MAX_CONDITIONAL_INNER_BYTES = constants.MAX_CONDITIONAL_INNER_BYTES;
+exports.CONDITIONAL_INNER_VARIANTS = constants.CONDITIONAL_INNER_VARIANTS;
 exports.MIN_ORACLE_STAKE_LAMPORTS = constants.MIN_ORACLE_STAKE_LAMPORTS;
 exports.MIN_VOTING_PERIOD_SLOTS = constants.MIN_VOTING_PERIOD_SLOTS;
 exports.MAX_VOTING_PERIOD_SLOTS = constants.MAX_VOTING_PERIOD_SLOTS;

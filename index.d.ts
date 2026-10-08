@@ -535,6 +535,36 @@ export const PROTOCOL_CONTRACT_IDS: {
   readonly pqKeys: 'xeris_pq_keys';
   readonly heartbeats: 'xeris_heartbeats';
 };
+/**
+ * The node's deny list `is_protected_contract_call` (`ledger.rs:2184-2320`):
+ * methods a generic ContractCall may not reach because a dedicated
+ * instruction is their only entry point. An id starting with a `prefixes` key
+ * is sealed for exactly that key's methods (`ledger.rs:2199-2201, 2212-2214`);
+ * any other id is looked up in `contracts` (`ledger.rs:2215-2319`). See
+ * `isProtectedContractCall`.
+ */
+export const PROTECTED_CONTRACT_CALLS: {
+  readonly prefixes: {
+    readonly agent_registry_: readonly ['validate_agent_tx', 'record_agent_spend'];
+    readonly identity_: readonly ['attest', 'record_activity'];
+  };
+  readonly contracts: {
+    readonly xeris_identities: readonly ['attest', 'record_activity'];
+    readonly xeris_governance: readonly ['propose', 'vote', 'execute'];
+    readonly xeris_heartbeats: readonly ['beat'];
+    readonly xeris_models: readonly ['register'];
+    readonly xeris_conditional_orders: readonly ['place_order', 'cancel_order', 'evaluate'];
+    readonly xeris_zk_verifier: readonly ['register_vk', 'submit_proof', 'verify_proof', 'record_nullifier', 'submit_attestation'];
+    readonly xeris_pq_keys: readonly ['register', 'rotate', 'record_pq_tx'];
+    readonly xeris_slashing_registry: readonly ['beat'];
+    readonly xeris_disputes: readonly ['open', 'resolve'];
+    readonly xeris_deals: readonly ['create', 'accept', 'confirm', 'cancel', 'reclaim', 'dispute', 'settle'];
+    readonly xeris_devices: readonly ['register', 'attest'];
+    readonly xeris_channels: readonly ['open', 'close', 'force_close'];
+    readonly xeris_tasks: readonly ['post', 'claim', 'submit_proof', 'verify', 'reject', 'cancel', 'expire_check'];
+    readonly xeris_capabilities: readonly ['register', 'update'];
+  };
+};
 /** Minimum `DisputeDeal.bond` in lamports (`contracts.rs:1008`). */
 export const MIN_DEAL_DISPUTE_BOND: 1000000000;
 /** Slots after which an active deal can be reclaimed (`contracts.rs:1079`). */
@@ -551,6 +581,14 @@ export const ORDER_STORAGE_BOND: 10000000;
 export const MAX_ORDER_LIFETIME_SLOTS: 650000;
 /** Maximum `ConditionalOrder.inner_instruction` length in bytes (`ledger.rs:6942`). */
 export const MAX_CONDITIONAL_INNER_BYTES: 2048;
+/**
+ * Variant indices a ConditionalOrder inner instruction can have and still run
+ * when the order fires: TokenMint, TokenTransfer, TokenBurn, TokenCreate,
+ * ContractCall, TokenCreateRWA, RWAUpdateStatus, RWATransfer, NativeTransfer
+ * (`ledger.rs:9098-9272`; `token.rs:1031-1333`). Any other variant is marked
+ * executed without running (`ledger.rs:9301`; `token.rs:1183-1199, 1333`).
+ */
+export const CONDITIONAL_INNER_VARIANTS: readonly [0, 1, 2, 3, 4, 6, 7, 8, 11];
 /** Minimum `RegisterOracle.stake_amount` in lamports (`ledger.rs:7170`). */
 export const MIN_ORACLE_STAKE_LAMPORTS: 1000000000;
 /** Minimum `CreateProposal.voting_period_slots` (`ledger.rs:8267-8272`). */
@@ -766,6 +804,8 @@ export function stringifyJson(value: unknown, field?: string): string;
  * `RangeError`. With `opts.forNode`, integer literals must also lie in
  * `-2^63..2^64-1` and nesting must not exceed 127 (the node's serde_json rules).
  * @throws {SyntaxError} Malformed JSON (`.code === 'syntax'`).
+ * @throws {TypeError} `opts` not an object, or `opts.forNode` not a boolean.
+ * @throws {RangeError} An `opts` key other than `forNode`, or a value listed above.
  */
 export function parseJson(text: string, field?: string, opts?: { forNode?: boolean }): unknown;
 
@@ -868,7 +908,7 @@ export interface InstructionBuilders {
   agentMessage(toIdentity: string, messageType: string, payloadJson: string, replyTo: string, expiresAtSlot: U64Input): Buffer;
   /** Variant 22. Always throws `FeatureDisabledError` (`feature: 'SubDelegate'`): rejected at ingress (`ledger.rs:1445-1450`) and skipped in blocks (`ledger.rs:6911-6914`). Use `registerAgent`. */
   subDelegate: DisabledBuilder;
-  /** Variant 23 (`token.rs:201-209`; handler `ledger.rs:6916-7122`). `innerInstruction` is encoded instruction bytes (<= `MAX_CONDITIONAL_INNER_BYTES` on the node). */
+  /** Variant 23 (`token.rs:201-209`; handler `ledger.rs:6916-7122`). `innerInstruction` is encoded instruction bytes (<= `MAX_CONDITIONAL_INNER_BYTES` on the node); only a variant in `CONDITIONAL_INNER_VARIANTS` runs when the order fires. */
   conditionalOrder(
     orderId: string, conditionType: string, conditionSource: string, conditionThreshold: U64Input,
     innerInstruction: BytesInput, expiresAtSlot: U64Input, lockedAmount: U64Input,
@@ -1174,8 +1214,8 @@ export class XerisKeypair {
    * Writes the keypair as a JSON array of 64 integers. `mode` applies when the
    * file is created (default `0o600`, as `bin/keypair_gen.rs:24-32`); an
    * existing file keeps its permissions.
-   * @throws {TypeError} When `path` is not a string or `mode` is not an integer.
-   * @throws {RangeError} When `mode` is outside `0..=0o7777`.
+   * @throws {TypeError} When `path` is not a string, `opts` is not an object or `mode` is not an integer.
+   * @throws {RangeError} When `opts` has a key other than `mode`, or `mode` is outside `0..=0o7777`.
    */
   saveToFile(path: string, opts?: { mode?: number }): void;
   /**
@@ -1310,9 +1350,16 @@ export function assertInstructionSubmittable(data: BytesInput, index?: number): 
  * ConditionalOrder inner instruction above `MAX_CONDITIONAL_INNER_BYTES`
  * (`ledger.rs:6941-6944`), an AgentExecute inner ContractCall to an
  * `agent_registry_` contract (`ledger.rs:6428-6431`), an AgentExecute inner TokenTransfer/TokenBurn
- * whose `from` is not the owner (`ledger.rs:6522, 6648-6655`), and a
+ * whose `from` is not the owner (`ledger.rs:6522, 6648-6655`), a
  * ConditionalOrder inner token instruction whose `from` / `mint_authority`
- * is not `payerPubkey` (`ledger.rs:9270-9272`).
+ * is not `payerPubkey` (`ledger.rs:9270-9272`), a ConditionalOrder
+ * `locked_amount` below `ORDER_STORAGE_BOND` (`ledger.rs:6998-7002`) or below
+ * its inner NativeTransfer amount (`ledger.rs:7008-7018`), and a
+ * ConditionalOrder inner variant outside `CONDITIONAL_INNER_VARIANTS` (marked
+ * executed without running, `ledger.rs:9257-9272, 9301`). A ContractCall to a
+ * protected protocol method (`isProtectedContractCall`, `ledger.rs:2184-2320`)
+ * is refused at the top level (`ledger.rs:5833-5837`) and inside AgentExecute
+ * (`ledger.rs:6432-6435`) or ConditionalOrder (`ledger.rs:9163-9166`).
  * @param instructions One encoded instruction or 1..`MAX_IX_PER_TX`; each passes `assertInstructionSubmittable`.
  * @param recentBlockhash 32 raw bytes (from `blockhashFromHex`).
  * @throws {TypeError} Wrong types.
@@ -2396,7 +2443,7 @@ export interface LiquidityArgs {
 // Client options and node business rules (src/client.js)
 // ---------------------------------------------------------------------------
 
-/** Options of `XerisClient` (and the client inside `XerisDApp` / `XerisAgent`). */
+/** Options of `XerisClient` (and the client inside `XerisDApp` / `XerisAgent`). Any other key throws `RangeError`. */
 export interface ClientOptions {
   /** RPC port appended to `host` (default `DEFAULT_RPC_PORT`). */
   rpcPort?: number;
@@ -2415,7 +2462,7 @@ export interface ClientOptions {
 /** Options of `XerisAgent`: the `XerisClient` options. */
 export type AgentOptions = ClientOptions;
 
-/** Options of `XerisDApp`. */
+/** Options of `XerisDApp`. Any other key throws `RangeError`. */
 export interface DAppOptions extends ClientOptions {
   /** Wallet provider to use instead of detecting `window.xeris`. */
   provider?: XerisWalletProvider;
@@ -2516,8 +2563,10 @@ export interface Checks {
    * `token.rs:1104, 1151`); a `ContractCall` needs args that serde_json
    * parses as an object (`ledger.rs:6436-6442`; no lone surrogate, no
    * out-of-range number; else `XerisError`, a swap payload → `agentSwap`), a
-   * method in `DELEGATED_CALL_METHODS` (else `agentDelegatedMethod`) and a
-   * `contractId` not starting with `agent_registry_`.
+   * method in `DELEGATED_CALL_METHODS` (else `agentDelegatedMethod`), a
+   * `contractId` not starting with `agent_registry_` and a method that
+   * `isProtectedContractCall` does not seal (else `RangeError`,
+   * `ledger.rs:6428-6435`).
    * @param ownerPubkey The AgentExecute `owner_pubkey` the inner instruction runs as.
    */
   agentInner(innerData: BytesInput, ownerPubkey: string): void;
@@ -2527,6 +2576,18 @@ export interface Checks {
 
 /** The node business rules; see `Checks`. */
 export const checks: Checks;
+
+/**
+ * The node's `is_protected_contract_call` (`ledger.rs:2184-2320`), a pure
+ * function of the two strings: `true` when a generic ContractCall to `method`
+ * on `contractId` is reserved for a dedicated instruction (see
+ * `PROTECTED_CONTRACT_CALLS`). The block checks it after charging the fee for a
+ * top-level ContractCall (`ledger.rs:5833-5837`), an AgentExecute inner call
+ * (`ledger.rs:6432-6435`) and a ConditionalOrder inner call when the order
+ * fires (`ledger.rs:9163-9166`); `buildTransaction` refuses all three.
+ * @throws {TypeError} When either argument is not a string.
+ */
+export function isProtectedContractCall(contractId: string, method: string): boolean;
 
 // ---------------------------------------------------------------------------
 // XerisClient (src/client.js)
@@ -2543,6 +2604,7 @@ export class XerisClient {
   /**
    * @param host Base URL with scheme, e.g. `'http://138.197.116.81'` (trailing slash stripped); may be `null` when both `opts.rpcUrl` and `opts.explorerUrl` are given.
    * @throws {TypeError|XerisError} `code 'config'` for a malformed host, URL or option.
+   * @throws {RangeError} For an option key outside `ClientOptions`, a port outside 1..65535 or a non-positive `timeoutMs`.
    */
   constructor(host: string | null, opts?: ClientOptions);
   /** Client for the published testnet validator (`http://TESTNET_SEED`, `network.rs:298`). */
@@ -2659,7 +2721,11 @@ export class XerisClient {
   rwaTransfer(keypair: XerisKeypair, tokenId: string, to: string, amount: U64Input): Promise<SubmitResult>;
   /** ContractDeploy with `stringifyJson(params)` (`bigint` written exactly). Preflight: `contractId`, `contractType` (a `ContractTypeAlias`, case-insensitive). */
   deployContract(keypair: XerisKeypair, contractId: string, contractType: string, params: Record<string, unknown>): Promise<SubmitResult>;
-  /** ContractCall. `args` is a plain object (written with `stringifyJson`; `bigint` exact), or exactly 16 raw bytes for the two swap methods. */
+  /**
+   * ContractCall. `args` is a plain object (written with `stringifyJson`; `bigint` exact), or exactly 16 raw bytes for the two swap methods.
+   * A method `isProtectedContractCall` seals (e.g. `xeris_channels` `open` / `close` / `force_close`, the `xeris_deals` mutators)
+   * throws `RangeError` before any I/O: the block skips it after charging the fee (`ledger.rs:2184-2320, 5833-5837`).
+   */
   callContract(keypair: XerisKeypair, contractId: string, method: string, args: Record<string, unknown> | BytesInput): Promise<SubmitResult>;
   /** AMM swap via `encodeSwapCall`. Preflight: `swapMethod`, `positive(inputAmount)`, `positive(minOutput)` (`contracts.rs:2419-2432`). */
   swap(keypair: XerisKeypair, poolId: string, method: SwapMethod, inputAmount: U64Input, minOutput: U64Input): Promise<SubmitResult>;
@@ -2701,12 +2767,18 @@ export class XerisClient {
   /** AgentMessage. Preflight: `oneOf(messageType, MESSAGE_TYPES)`, `maxBytes(payloadJson, 8192)`. */
   sendAgentMessage(keypair: XerisKeypair, toIdentity: string, messageType: MessageType, payloadJson: string, replyTo: string, expiresAtSlot: U64Input): Promise<SubmitResult>;
   /**
-   * ConditionalOrder. Preflight: `oneOf(conditionType, CONDITION_TYPES)`,
+   * ConditionalOrder: escrows `lockedAmount`; when the condition holds the node runs the inner
+   * instruction as the signer, but only a variant in `CONDITIONAL_INNER_VARIANTS` (any other is
+   * marked executed without running, `ledger.rs:9257-9272, 9301`; `token.rs:1183-1199, 1333`).
+   * Preflight: `oneOf(conditionType, CONDITION_TYPES)`,
    * `innerInstruction.length <= MAX_CONDITIONAL_INNER_BYTES` (`ledger.rs:6941-6944`),
    * the inner bytes decode as a `XerisInstruction` (else `EncodingError`, `ledger.rs:6923-6927`),
-   * `lockedAmount >= ORDER_STORAGE_BOND`, `assertInstructionSubmittable(inner)` and inner
-   * variant not 17/23 (`ledger.rs:1439`). `buildTransaction` also requires an inner token
-   * instruction's `from` / `mint_authority` to be the signer, who owns the order.
+   * `assertInstructionSubmittable(inner)`, inner variant not 17/23 (`ledger.rs:1439`) and in
+   * `CONDITIONAL_INNER_VARIANTS`, an inner ContractCall not sealed by `isProtectedContractCall`
+   * (`ledger.rs:9163-9166`), `lockedAmount >= ORDER_STORAGE_BOND` (`ledger.rs:6998-7002`) and,
+   * for an inner NativeTransfer, `lockedAmount >= amount` (`ledger.rs:7008-7018`).
+   * `buildTransaction` also requires an inner token instruction's `from` / `mint_authority`
+   * to be the signer, who owns the order.
    */
   conditionalOrder(
     keypair: XerisKeypair, orderId: string, conditionType: ConditionType, conditionSource: string, conditionThreshold: U64Input,
@@ -3024,7 +3096,7 @@ export type DAppEvent = 'connect' | 'disconnect' | 'accountChanged';
  * here (the dedicated routes add nothing on the wallet-signed path).
  */
 export class XerisDApp {
-  /** @throws {TypeError|RangeError|XerisError} On malformed options. */
+  /** @throws {TypeError|RangeError|XerisError} On malformed options; `RangeError` for a key outside `DAppOptions`. */
   constructor(opts?: DAppOptions);
   /**
    * `window.xeris`, else `window.solana` when it sets `isXeris === true`, else
@@ -3172,7 +3244,7 @@ export class XerisAgent {
    * @param ownerPubkey Canonical public key of the owner who registered this agent.
    * @param host Node base URL with scheme (required).
    * @throws {TypeError} Non-keypair, non-string owner, or missing host.
-   * @throws {RangeError} Non-canonical owner key.
+   * @throws {RangeError} Non-canonical owner key, or an option key outside `ClientOptions`.
    * @throws {XerisError} `code 'config'` for a malformed host.
    */
   constructor(keypair: XerisKeypair, ownerPubkey: string, host: string, opts?: AgentOptions);
@@ -3230,7 +3302,7 @@ export class XerisAgent {
   wrapXrs(amountXrs: XrsInput): Promise<SubmitResult>;
   /** Inner `unwrapXrs(lamports)`. */
   unwrapXrs(amountXrs: XrsInput): Promise<SubmitResult>;
-  /** Inner `contractCall` with JSON-object `args` only; `checks.agentInner` enforces `DELEGATED_CALL_METHODS` (`ledger.rs:2138-2175`). */
+  /** Inner `contractCall` with JSON-object `args` only; `checks.agentInner` enforces `DELEGATED_CALL_METHODS` (`ledger.rs:2138-2175`) and refuses a method `isProtectedContractCall` seals (`ledger.rs:6432-6435`). */
   callContract(contractId: string, method: string, args: Record<string, unknown>): Promise<SubmitResult>;
   /** Delegated `add_liquidity`, budgeted via `quote_add_liquidity` (`ledger.rs:6448-6459`). */
   addLiquidity(poolId: string, amountA: U64Input, amountB: U64Input, minLpShares: U64Input, minAmountA: U64Input, minAmountB: U64Input): Promise<SubmitResult>;

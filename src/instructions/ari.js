@@ -363,7 +363,10 @@ function subDelegate() {
  * ORDER_STORAGE_BOND` = 10,000,000 lamports (`ledger.rs:6998, 1290`); an inner
  * NativeTransfer must name a canonical destination and be covered by the lock
  * (`ledger.rs:7008-7030`); at most 100 active orders per owner
- * (`ledger.rs:1325`). The lock is refunded on cancel or expiry.
+ * (`ledger.rs:1325`). The lock is refunded on cancel or expiry. When the order
+ * fires, only an inner variant in `CONDITIONAL_INNER_VARIANTS` runs; any other
+ * is marked executed without running (`ledger.rs:9257-9272, 9301`;
+ * `token.rs:1183-1199, 1333`).
  * @param {string} orderId order identifier
  * @param {string} conditionType condition type string
  * @param {string} conditionSource pool id, oracle id or address the condition reads

@@ -696,6 +696,13 @@ test('parseJson matches JSON.parse except for big integers, out-of-range floats 
   assert.throws(() => enc.parseJson(`${'['.repeat(128)}${']'.repeat(128)}`, 'args', { forNode: true }), RangeError);
   assert.doesNotThrow(() => enc.parseJson(`${'['.repeat(127)}${']'.repeat(127)}`, 'args', { forNode: true }));
   assert.doesNotThrow(() => enc.parseJson(`${'['.repeat(500)}${']'.repeat(500)}`));
+  // Options: only a boolean `forNode`, in an object.
+  assert.throws(() => enc.parseJson('{}', 'x', { fornode: true }), (e) => e instanceof RangeError && /x: opts\.fornode: unknown option \(allowed: forNode\)/.test(e.message));
+  assert.throws(() => enc.parseJson('{"a":18446744073709551616}', 'x', { forNode: 'yes' }), TypeError);
+  assert.throws(() => enc.parseJson('{}', 'x', []), TypeError);
+  assert.throws(() => enc.parseJson('{}', 'x', null), TypeError);
+  assert.deepEqual(enc.parseJson('{}', 'x', { forNode: false }), {});
+  assert.deepEqual(enc.parseJson('{}', 'x', {}), {});
 });
 
 test('stringifyJson and parseJson round-trip random values like the native JSON functions', () => {

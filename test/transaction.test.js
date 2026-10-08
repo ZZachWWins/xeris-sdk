@@ -9,11 +9,15 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const bs58 = require('bs58');
 
+const { createHash } = require('node:crypto');
+
 const {
   Instructions, XerisKeypair, EncodingError, FeatureDisabledError, RpcError, XerisError,
   blockhashFromHex, buildTransaction, signTransaction, serializeTransaction, signatureOf,
   assembleSignedTransaction, assertInstructionSubmittable, parseSubmitResponse, encodeVariant,
-  MAX_IX_DATA_SIZE, MAX_SLASH_IX_DATA_SIZE, MAX_IX_PER_TX,
+  isProtectedContractCall, VARIANT_NAMES,
+  MAX_IX_DATA_SIZE, MAX_SLASH_IX_DATA_SIZE, MAX_IX_PER_TX, MAX_CONDITIONAL_INNER_BYTES,
+  ORDER_STORAGE_BOND, CONDITIONAL_INNER_VARIANTS, PROTECTED_CONTRACT_CALLS,
 } = require('..');
 const { serializedFromWalletResult, submitBody } = require('../src/transaction');
 const H = require('./_helpers');
@@ -302,17 +306,17 @@ test('buildTransaction refuses a nested ContractCall whose args serde_json canno
     assert.throws(() => build(Instructions.agentExecute(P, inner)),
       (e) => e instanceof RangeError && /nested ContractCall pool\.add_liquidity: AgentExecute args/.test(e.message) && /ledger\.rs:6436-6442/.test(e.message));
     // ConditionalOrder: contract_call_args at ledger.rs:9181 when the order fires.
-    assert.throws(() => build(Instructions.conditionalOrder('o1', 'slot_reached', 'x', 5, inner, 1000, 0)),
+    assert.throws(() => build(Instructions.conditionalOrder('o1', 'slot_reached', 'x', 5, inner, 1000, ORDER_STORAGE_BOND)),
       (e) => e instanceof RangeError && /nested ContractCall pool\.add_liquidity: ConditionalOrder args/.test(e.message) && /ledger\.rs:2359-2371, 9181/.test(e.message));
   }
   // The 16-byte swap payload passes contract_call_args (ConditionalOrder) but not the
   // AgentExecute JSON-object requirement.
   const swap = Instructions.contractCall('pool', 'swap_a_to_b', Buffer.alloc(16));
-  assert.equal(build(Instructions.conditionalOrder('o1', 'slot_reached', 'x', 5, swap, 1000, 0)).instructions.length, 1);
+  assert.equal(build(Instructions.conditionalOrder('o1', 'slot_reached', 'x', 5, swap, 1000, ORDER_STORAGE_BOND)).instructions.length, 1);
   assert.throws(() => build(Instructions.agentExecute(P, swap)), /AgentExecute args must be a JSON object/);
   const good = Instructions.contractCall('pool', 'add_liquidity', { amount_a: 1, amount_b: 2n ** 63n });
   assert.equal(build(Instructions.agentExecute(P, good)).instructions.length, 1);
-  assert.equal(build(Instructions.conditionalOrder('o1', 'slot_reached', 'x', 5, good, 1000, 0)).instructions.length, 1);
+  assert.equal(build(Instructions.conditionalOrder('o1', 'slot_reached', 'x', 5, good, 1000, ORDER_STORAGE_BOND)).instructions.length, 1);
 });
 
 test('buildTransaction refuses an actor field that is not the signer (block skips it after the fee)', () => {
@@ -433,8 +437,11 @@ test('buildTransaction refuses AgentExecute / ConditionalOrder payloads the bloc
   rejects(order('bogus', Instructions.wrapXrs(1)), /condition_type "bogus" is not one of.*ledger\.rs:6916-6921/);
   rejects(order('slot_reached', Buffer.from([11, 0, 0, 0])), /ConditionalOrder inner_instruction does not decode.*ledger\.rs:6923-6927/);
   rejects(order('slot_reached', Instructions.cancelConditionalOrder('x'.repeat(2100))), /2112 bytes, above the 2048-byte cap.*ledger\.rs:6941-6944/);
-  // Accepted: a decodable, allow-listed inner instruction within the cap.
-  assert.equal(buildTransaction(P, [order('slot_reached', Instructions.cancelConditionalOrder('x'.repeat(2036)))], bh).instructions.length, 1);
+  // Accepted: a decodable inner instruction that runs when the order fires, exactly at the cap.
+  const pad = MAX_CONDITIONAL_INNER_BYTES - Instructions.contractCall('pool', 'add_liquidity', { p: '' }).length;
+  const atCap = Instructions.contractCall('pool', 'add_liquidity', { p: 'x'.repeat(pad) });
+  assert.equal(atCap.length, MAX_CONDITIONAL_INNER_BYTES);
+  assert.equal(buildTransaction(P, [order('slot_reached', atCap)], bh).instructions.length, 1);
   assert.equal(buildTransaction(P, [Instructions.agentExecute(O, Instructions.wrapXrs(1))], bh).instructions.length, 1);
 });
 
@@ -471,4 +478,198 @@ test('buildTransaction binds token-processor actor fields to the signer, and nes
   ]) {
     assert.equal(build(ok).instructions.length, 1);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Protected protocol methods (ledger.rs:2184-2320) and ConditionalOrder rules
+// ---------------------------------------------------------------------------
+
+test('isProtectedContractCall mirrors the node unit tests (ledger.rs:9896-9942, 11350-11353)', () => {
+  const sealed = (id, m) => assert.equal(isProtectedContractCall(id, m), true, `${id}.${m}`);
+  const open = (id, m) => assert.equal(isProtectedContractCall(id, m), false, `${id}.${m}`);
+  // protected_contract_calls_detected, ledger.rs:9896-9942
+  sealed('xeris_conditional_orders', 'place_order');
+  sealed('xeris_conditional_orders', 'cancel_order');
+  sealed('xeris_conditional_orders', 'evaluate');
+  sealed('xeris_zk_verifier', 'submit_proof');
+  sealed('xeris_zk_verifier', 'verify_proof');
+  sealed('xeris_zk_verifier', 'register_vk');
+  sealed('xeris_pq_keys', 'register');
+  sealed('xeris_pq_keys', 'rotate');
+  sealed('xeris_pq_keys', 'record_pq_tx');
+  sealed('xeris_slashing_registry', 'beat');
+  sealed('xeris_devices', 'register');
+  sealed('xeris_devices', 'attest');
+  open('xeris_devices', 'deactivate');
+  open('xeris_conditional_orders', 'list_orders');
+  open('xeris_channels', 'join');
+  open('xeris_pq_keys', 'get_key');
+  open('some_user_contract', 'place_order');
+  sealed('xeris_channels', 'close');
+  sealed('xeris_channels', 'force_close');
+  open('xeris_channels', 'challenge_update');
+  open('xeris_channels', 'finalize_dispute');
+  // agent_registry_cid (ledger.rs:1551-1553): "agent_registry_" + sha256_hex(owner)[..32]
+  const reg = `agent_registry_${createHash('sha256').update('SomeOwnerPubkey1111111111111111111111111111').digest('hex').slice(0, 32)}`;
+  assert.ok(reg.startsWith('agent_registry_'));
+  sealed(reg, 'record_agent_spend');
+  sealed(reg, 'validate_agent_tx');
+  open(reg, 'register_agent');
+  open(reg, 'update_agent');
+  open(reg, 'get_agent');
+  open(reg, 'list_agents');
+  // xwc65_device_register_sealed_and_caller_bound, ledger.rs:11350-11353
+  sealed('xeris_devices', 'register');
+  sealed('xeris_devices', 'attest');
+  open('xeris_devices', 'deactivate');
+  open('xeris_devices', 'get_device');
+  // A prefix rule decides alone; ids are matched exactly; the lookup is an own-property lookup.
+  sealed('identity_abc', 'attest');
+  sealed('identity_abc', 'record_activity');
+  open('identity_abc', 'register');
+  open('agent_registry_xeris_channels', 'close');
+  open('xeris_channels_v2', 'close');
+  open('Xeris_channels', 'close');
+  open('__proto__', 'constructor');
+  open('constructor', 'name');
+  assert.throws(() => isProtectedContractCall('xeris_channels'), TypeError);
+  assert.throws(() => isProtectedContractCall(null, 'close'), TypeError);
+});
+
+test('PROTECTED_CONTRACT_CALLS is the exact, frozen deny table of ledger.rs:2184-2320', () => {
+  assert.deepEqual(JSON.parse(JSON.stringify(PROTECTED_CONTRACT_CALLS)), {
+    prefixes: {
+      agent_registry_: ['validate_agent_tx', 'record_agent_spend'],
+      identity_: ['attest', 'record_activity'],
+    },
+    contracts: {
+      xeris_identities: ['attest', 'record_activity'],
+      xeris_governance: ['propose', 'vote', 'execute'],
+      xeris_heartbeats: ['beat'],
+      xeris_models: ['register'],
+      xeris_conditional_orders: ['place_order', 'cancel_order', 'evaluate'],
+      xeris_zk_verifier: ['register_vk', 'submit_proof', 'verify_proof', 'record_nullifier', 'submit_attestation'],
+      xeris_pq_keys: ['register', 'rotate', 'record_pq_tx'],
+      xeris_slashing_registry: ['beat'],
+      xeris_disputes: ['open', 'resolve'],
+      xeris_deals: ['create', 'accept', 'confirm', 'cancel', 'reclaim', 'dispute', 'settle'],
+      xeris_devices: ['register', 'attest'],
+      xeris_channels: ['open', 'close', 'force_close'],
+      xeris_tasks: ['post', 'claim', 'submit_proof', 'verify', 'reject', 'cancel', 'expire_check'],
+      xeris_capabilities: ['register', 'update'],
+    },
+  });
+  assert.ok(Object.isFrozen(PROTECTED_CONTRACT_CALLS));
+  for (const part of [PROTECTED_CONTRACT_CALLS.prefixes, PROTECTED_CONTRACT_CALLS.contracts]) {
+    assert.ok(Object.isFrozen(part));
+    for (const list of Object.values(part)) assert.ok(Object.isFrozen(list));
+  }
+  for (const [id, methods] of Object.entries(PROTECTED_CONTRACT_CALLS.contracts)) {
+    for (const m of methods) assert.equal(isProtectedContractCall(id, m), true, `${id}.${m}`);
+  }
+});
+
+test('buildTransaction refuses a ContractCall to a protected method at the top level, in AgentExecute and in ConditionalOrder', () => {
+  const kp = H.goldenKeypair();
+  const bh = blockhashFromHex(H.GOLDEN_BLOCKHASH_HEX);
+  const P = kp.publicKey;
+  const O = H.OTHER_PUBKEY;
+  const build = (ix) => buildTransaction(P, [ix], bh);
+  const rejects = (ix, re) => assert.throws(() => build(ix), (e) => e instanceof RangeError && re.test(e.message), String(re));
+  const order = (inner) => Instructions.conditionalOrder('o', 'slot_reached', 's', 1, inner, 1000, 10n ** 9n);
+  const top = /protected protocol method .*the block skips it after charging the fee \(ledger\.rs:2184-2320, 5833-5837\)/;
+  rejects(Instructions.contractCall('xeris_governance', 'vote', { proposal_id: 'p', vote: 'yes' }), /ContractCall xeris_governance\.vote is a protected/);
+  rejects(Instructions.contractCall('xeris_governance', 'vote', { proposal_id: 'p', vote: 'yes' }), top);
+  rejects(Instructions.contractCall('xeris_channels', 'close', { channel_id: 'c' }), top);
+  rejects(Instructions.contractCall('xeris_deals', 'settle', { deal_id: 'd' }), top);
+  rejects(Instructions.contractCall('identity_abc', 'attest', { score: 1 }), top);
+  rejects(Instructions.contractCall('agent_registry_abc', 'record_agent_spend', { spend_amount: 1 }), top);
+  // The deny list is checked before the args (ledger.rs:5833 precedes 5884).
+  rejects(Instructions.contractCall('xeris_deals', 'settle', Buffer.from('not json')), top);
+  rejects(order(Instructions.contractCall('xeris_tasks', 'verify', { task_id: 't' })),
+    /nested ContractCall xeris_tasks\.verify is a protected protocol method .*the order is cancelled when it fires \(ledger\.rs:2184-2320, 9163-9166\)/);
+  rejects(Instructions.agentExecute(O, Instructions.contractCall('xeris_deals', 'cancel', { deal_id: 'd' })),
+    /nested ContractCall xeris_deals\.cancel is a protected protocol method .*\(ledger\.rs:2184-2320, 6432-6435\)/);
+  // Unsealed methods, including ones on protocol and per-owner contracts, still build.
+  for (const ok of [
+    Instructions.contractCall('xeris_devices', 'deactivate', { device_pubkey: P }),
+    Instructions.contractCall('xeris_channels', 'challenge_update', { channel_id: 'c' }),
+    Instructions.contractCall('agent_registry_x', 'register_agent', { agent_pubkey: O }),
+    Instructions.agentExecute(O, Instructions.contractCall('xeris_channels', 'challenge_update', { channel_id: 'c' })),
+    order(Instructions.contractCall('xeris_devices', 'deactivate', { device_pubkey: P })),
+  ]) {
+    assert.equal(build(ok).instructions.length, 1);
+  }
+});
+
+test('buildTransaction refuses a ConditionalOrder inner variant that does nothing when the order fires', () => {
+  const kp = H.goldenKeypair();
+  const bh = blockhashFromHex(H.GOLDEN_BLOCKHASH_HEX);
+  const P = kp.publicKey;
+  const O = H.OTHER_PUBKEY;
+  const build = (ix) => buildTransaction(P, [ix], bh);
+  const order = (inner) => Instructions.conditionalOrder('o', 'slot_reached', 's', 1, inner, 1000, 10n ** 9n);
+  const noop = /ConditionalOrder inner \w+ \(variant \d+\) does nothing when the order fires: the node marks the order executed without running it .*\(ledger\.rs:9257-9272, 9301; token\.rs:1183-1199, 1333\)/;
+  assert.deepEqual(CONDITIONAL_INNER_VARIANTS.map((v) => VARIANT_NAMES[v]),
+    ['TokenMint', 'TokenTransfer', 'TokenBurn', 'TokenCreate', 'ContractCall', 'TokenCreateRWA', 'RWAUpdateStatus', 'RWATransfer', 'NativeTransfer']);
+  assert.ok(Object.isFrozen(CONDITIONAL_INNER_VARIANTS));
+  for (const inner of [
+    Instructions.wrapXrs(5),
+    Instructions.stake(P, 10n ** 12n),
+    Instructions.createDeal('d1', O, 10n ** 9n, 'terms'),
+    Instructions.contractDeploy('cid', 'Swap', '{}'),
+    Instructions.cancelConditionalOrder('o0'),
+  ]) {
+    assert.throws(() => build(order(inner)), (e) => e instanceof RangeError && noop.test(e.message), VARIANT_NAMES[inner[0]]);
+  }
+  // Every variant outside the list is refused (reference encodings of all 62 variants).
+  for (const v of require('./vectors.json')) {
+    const inner = Buffer.from(v.hex, 'hex');
+    let err = null;
+    try { build(order(inner)); } catch (e) { err = e; }
+    if (CONDITIONAL_INNER_VARIANTS.includes(v.index)) {
+      assert.ok(err === null || !noop.test(err.message), `${v.variant} runs when the order fires`);
+    } else if (v.index === 17 || v.index === 23) {
+      assert.match(err.message, /recursive delegated\/conditional/, v.variant);
+    } else if (inner.length > MAX_CONDITIONAL_INNER_BYTES) {
+      assert.match(err.message, /above the 2048-byte cap/, v.variant);
+    } else {
+      assert.ok(err instanceof RangeError && noop.test(err.message), `${v.variant}: ${err && err.message}`);
+    }
+  }
+  const rwa = Instructions.tokenCreateRWA('r', 'N', 'S', 0, 10, P, 'real_estate', 'h', 'u', 'US', false, false, 1);
+  for (const ok of [
+    Instructions.tokenMint('t', O, 1),
+    Instructions.tokenTransfer('t', P, O, 5),
+    Instructions.tokenBurn('t', P, 5),
+    Instructions.tokenCreate('t', 'N', 'S', 6, 1000, P),
+    Instructions.contractCall('pool', 'add_liquidity', { amount_a: 1 }),
+    rwa,
+    Instructions.rwaUpdateStatus('r', 'frozen', null, null, null),
+    Instructions.rwaTransfer('r', P, O, 1),
+    Instructions.nativeTransfer(P, O, 1),
+  ]) {
+    assert.equal(build(order(ok)).instructions.length, 1, VARIANT_NAMES[ok[0]]);
+  }
+});
+
+test('buildTransaction refuses a ConditionalOrder whose lock is below the bond or the inner NativeTransfer (ledger.rs:6998-7018)', () => {
+  const kp = H.goldenKeypair();
+  const bh = blockhashFromHex(H.GOLDEN_BLOCKHASH_HEX);
+  const P = kp.publicKey;
+  const O = H.OTHER_PUBKEY;
+  const build = (ix) => buildTransaction(P, [ix], bh);
+  const order = (inner, locked) => Instructions.conditionalOrder('o', 'slot_reached', 's', 1, inner, 1000, locked);
+  const bond = /ConditionalOrder locked_amount \d+ is below the storage bond 10000000 lamports; the block skips it after charging the fee \(ledger\.rs:6998-7002\)/;
+  const cover = /ConditionalOrder locked_amount 10000000 does not cover the inner NativeTransfer amount 5000000000; the block skips it after charging the fee \(ledger\.rs:7008-7018\)/;
+  for (const locked of [0, ORDER_STORAGE_BOND - 1]) {
+    assert.throws(() => build(order(Instructions.nativeTransfer(P, O, 1), locked)), (e) => e instanceof RangeError && bond.test(e.message), String(locked));
+    assert.throws(() => build(order(Instructions.tokenTransfer('t', P, O, 1), locked)), (e) => e instanceof RangeError && bond.test(e.message), String(locked));
+  }
+  assert.equal(build(order(Instructions.nativeTransfer(P, O, 1), ORDER_STORAGE_BOND)).instructions.length, 1);
+  assert.throws(() => build(order(Instructions.nativeTransfer(P, O, 5_000_000_000n), ORDER_STORAGE_BOND)), (e) => e instanceof RangeError && cover.test(e.message));
+  assert.throws(() => build(order(Instructions.nativeTransfer(P, O, 5_000_000_000n), 4_999_999_999n)), /does not cover the inner NativeTransfer/);
+  assert.equal(build(order(Instructions.nativeTransfer(P, O, 5_000_000_000n), 5_000_000_000n)).instructions.length, 1);
+  // The cover rule applies to an inner NativeTransfer only (ledger.rs:7008-7010).
+  assert.equal(build(order(Instructions.tokenTransfer('t', P, O, 5_000_000_000n), ORDER_STORAGE_BOND)).instructions.length, 1);
 });

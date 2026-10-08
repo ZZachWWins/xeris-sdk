@@ -30,7 +30,7 @@ const TRANSACTION = [
   'assertInstructionSubmittable', 'parseSubmitResponse', 'signatureOf', 'isCanonicalPubkey', 'pubkeyBytes',
 ];
 const ERRORS = ['XerisError', 'EncodingError', 'FeatureDisabledError', 'RpcError', 'DISABLED_FEATURES'];
-const OTHER = ['checks', 'TestVectors'];
+const OTHER = ['checks', 'isProtectedContractCall', 'TestVectors'];
 const CONSTANTS = [
   'VERSION', 'XRS_DECIMALS', 'LAMPORTS_PER_XRS', 'BASE_TX_FEE', 'BASE_TX_FEE_XRS', 'DEFAULT_RPC_PORT',
   'DEFAULT_EXPLORER_PORT', 'DEFAULT_P2P_PORT', 'TESTNET_SEED', 'MAINNET_HOST_ENV', 'CHAIN_ID_TESTNET',
@@ -48,9 +48,9 @@ const CONSTANTS = [
   'DEVICE_TYPES', 'TASK_VERIFICATION_MODES', 'TASK_RESOLUTIONS', 'DISPUTE_ACTIONS', 'VOTES',
   'RWA_ASSET_TYPES', 'RWA_STATUSES', 'CONTRACT_TYPE_ALIASES', 'PROTOCOL_MANAGED_CONTRACT_TYPES',
   'RESERVED_CONTRACT_ID_PREFIXES', 'RESERVED_CONTRACT_ID_SUFFIXES', 'CONTRACT_ID_PATTERN',
-  'PROTOCOL_CONTRACT_IDS', 'MIN_DEAL_DISPUTE_BOND', 'DEAL_TIMEOUT_SLOTS', 'DISPUTE_CHALLENGE_PERIOD_SLOTS',
+  'PROTOCOL_CONTRACT_IDS', 'PROTECTED_CONTRACT_CALLS', 'MIN_DEAL_DISPUTE_BOND', 'DEAL_TIMEOUT_SLOTS', 'DISPUTE_CHALLENGE_PERIOD_SLOTS',
   'DISPUTE_MAX_LIFETIME_SLOTS', 'MAX_TASK_LIFETIME_SLOTS', 'ORDER_STORAGE_BOND', 'MAX_ORDER_LIFETIME_SLOTS',
-  'MAX_CONDITIONAL_INNER_BYTES', 'MIN_ORACLE_STAKE_LAMPORTS', 'MIN_VOTING_PERIOD_SLOTS',
+  'MAX_CONDITIONAL_INNER_BYTES', 'CONDITIONAL_INNER_VARIANTS', 'MIN_ORACLE_STAKE_LAMPORTS', 'MIN_VOTING_PERIOD_SLOTS',
   'MAX_VOTING_PERIOD_SLOTS', 'DEFAULT_PROPOSAL_QUORUM', 'MIN_PROPOSAL_STAKE_LAMPORTS',
   'LAUNCHPAD_XERIS_FEE_BPS', 'REGISTRY_PAGE_ITEMS', 'ACCOUNT_HISTORY_MAX_PAGE_SIZE',
   'ACCOUNT_HISTORY_MAX_PAGE', 'LIST_MAX_PAGE_SIZE', 'SIGNATURES_MAX_LIMIT', 'PRICE_HISTORY_MAX_LIMIT', 'TX_STATUSES', 'STRING_LIMITS',
@@ -80,7 +80,7 @@ test('every export is a named export under Node ESM (cjs-module-lexer detection)
 });
 
 test('internal helpers are not exported', () => {
-  for (const name of ['_raw', 'disabledFeature', 'submitBody', 'serializedFromWalletResult', 'concat', 'toBytes', 'assertString', 'isPlainJsonObject', 'assertJsonObjectText']) {
+  for (const name of ['_raw', 'disabledFeature', 'submitBody', 'serializedFromWalletResult', 'concat', 'toBytes', 'assertString', 'isPlainJsonObject', 'assertJsonObjectText', 'protectedCallProblem', 'onlyKeys', 'CLIENT_OPTION_KEYS']) {
     assert.equal(name in sdk, false, name);
   }
 });

@@ -371,13 +371,18 @@ class XerisKeypair {
    *   file is created (default `0o600`, as `bin/keypair_gen.rs:24-32`); like that
    *   tool, an existing file keeps its current permissions.
    * @returns {void}
-   * @throws {TypeError} When `path` is not a string or `mode` is not an integer.
-   * @throws {RangeError} When `mode` is outside `0..=0o7777`.
+   * @throws {TypeError} When `path` is not a string, `opts` is not an object or `mode` is not an integer.
+   * @throws {RangeError} When `opts` has a key other than `mode`, or `mode` is outside `0..=0o7777`.
    */
-  saveToFile(path, opts = { mode: 0o600 }) {
+  saveToFile(path, opts = {}) {
     if (typeof path !== 'string') throw new TypeError(`saveToFile: path must be a string, got ${describe(path)}`);
-    const o = opts === null || typeof opts !== 'object' ? {} : opts;
-    const mode = o.mode === undefined ? 0o600 : o.mode;
+    if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new TypeError(`saveToFile: opts must be an object such as { mode: 0o600 }, got ${describe(opts)}`);
+    }
+    for (const key of Object.keys(opts)) {
+      if (key !== 'mode') throw new RangeError(`saveToFile: opts.${key}: unknown option (allowed: mode)`);
+    }
+    const mode = opts.mode === undefined ? 0o600 : opts.mode;
     if (typeof mode !== 'number' || !Number.isInteger(mode)) throw new TypeError(`saveToFile: mode must be an integer, got ${describe(mode)}`);
     if (mode < 0 || mode > 0o7777) throw new RangeError(`saveToFile: mode must be within 0..=0o7777, got ${mode}`);
     fileSystem().writeFileSync(path, JSON.stringify(this.toJsonBytes()), { mode, flag: 'w' });

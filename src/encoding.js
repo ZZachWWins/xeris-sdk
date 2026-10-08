@@ -962,14 +962,21 @@ class JsonReader {
  *   limits of the node's serde_json reader to text the SDK is about to send:
  *   integer literals must lie in `-2^63..2^64-1` and nesting must not exceed 127.
  * @returns {unknown}
- * @throws {TypeError} When `text` is not a string.
+ * @throws {TypeError} When `text` is not a string, `opts` is not an object or
+ *   `opts.forNode` is not a boolean.
  * @throws {SyntaxError} Malformed JSON (`.code === 'syntax'`, message gives the position).
- * @throws {RangeError} As listed above.
+ * @throws {RangeError} As listed above, and for an `opts` key other than `forNode`.
  */
 function parseJson(text, field = 'json', opts = {}) {
   const f = fieldName(field, 'json');
   assertString(text, f);
-  if (opts === null || typeof opts !== 'object') throw typeError(f, `opts: expected an object, got ${describe(opts)}`);
+  if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) throw typeError(f, `opts: expected an object, got ${describe(opts)}`);
+  for (const key of Object.keys(opts)) {
+    if (key !== 'forNode') throw rangeError(f, `opts.${key}: unknown option (allowed: forNode)`);
+  }
+  if (opts.forNode !== undefined && typeof opts.forNode !== 'boolean') {
+    throw typeError(f, `opts.forNode: expected a boolean, got ${describe(opts.forNode)}`);
+  }
   const reader = new JsonReader(text, f, opts.forNode === true);
   const value = reader.value(0, f);
   reader.skipWs();

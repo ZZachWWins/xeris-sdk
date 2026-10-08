@@ -6,7 +6,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Transaction } = require('@solana/web3.js');
 
-const { XerisAgent, XerisKeypair, Instructions, FeatureDisabledError, XerisError, EncodingError, AGENT_INNER_VARIANTS } = require('..');
+const { XerisAgent, XerisKeypair, Instructions, FeatureDisabledError, XerisError, EncodingError, AGENT_INNER_VARIANTS, checks } = require('..');
 const H = require('./_helpers');
 
 const BOB = '11111111111111111111111111111112';
@@ -31,6 +31,10 @@ test('the constructor requires a host; testnet()/mainnet() name the network', ()
   assert.throws(() => new XerisAgent(kp, OWNER), TypeError);
   assert.throws(() => new XerisAgent(kp, 'Alice', 'http://h'), RangeError);
   assert.ok(XerisAgent.testnet(kp, OWNER, { fetch: async () => {} }) instanceof XerisAgent);
+  // Options go to XerisClient, which refuses unknown keys.
+  assert.throws(() => new XerisAgent(kp, OWNER, 'http://h', { fetch: async () => {}, timeout: 5 }), (e) => e instanceof RangeError && /opts\.timeout: unknown option; use timeoutMs/.test(e.message));
+  assert.throws(() => XerisAgent.testnet(kp, OWNER, { timeout: 5 }), RangeError);
+  assert.throws(() => XerisAgent.mainnet(kp, OWNER, 'http://h', { rpcport: 1 }), RangeError);
 });
 
 test('execute wraps an allowed inner instruction in AgentExecute for the owner', async () => {
@@ -127,4 +131,20 @@ test('execute refuses an inner TokenTransfer/TokenBurn whose from is not the own
   assert.equal(fetch.calls.length, 0);
   await agent.execute(Instructions.tokenBurn('tok', OWNER, 5));
   assert.deepEqual(sentIx(fetch), Instructions.agentExecute(OWNER, Instructions.tokenBurn('tok', OWNER, 5)));
+});
+
+test('execute / callContract refuse a protected protocol method before any I/O (ledger.rs:2184-2320, 6432-6435)', async () => {
+  const { agent, fetch } = make();
+  const sealed = /innerInstruction: nested ContractCall \S+ is a protected protocol method .*\(ledger\.rs:2184-2320, 6432-6435\)/;
+  // `create`, `open`, `post`, `place_order`, `cancel` are in DELEGATED_CALL_METHODS, so only the deny list catches them.
+  await assert.rejects(agent.execute(Instructions.contractCall('xeris_deals', 'cancel', {})), (e) => e instanceof RangeError && sealed.test(e.message));
+  await assert.rejects(agent.execute(Instructions.contractCall('xeris_deals', 'create', { amount: 5 })), (e) => e instanceof RangeError && sealed.test(e.message));
+  await assert.rejects(agent.execute(Instructions.contractCall('xeris_conditional_orders', 'place_order', { order_id: 'o' })), (e) => e instanceof RangeError && sealed.test(e.message));
+  await assert.rejects(agent.callContract('xeris_channels', 'open', { channel_id: 'c' }), (e) => e instanceof RangeError && sealed.test(e.message));
+  await assert.rejects(agent.callContract('xeris_tasks', 'post', { task_id: 't' }), (e) => e instanceof RangeError && sealed.test(e.message));
+  assert.equal(fetch.calls.length, 0);
+  assert.throws(() => checks.agentInner(Instructions.contractCall('xeris_deals', 'create', { amount: 5 }), OWNER), (e) => e instanceof RangeError && sealed.test(e.message));
+  assert.equal(checks.agentInner(Instructions.contractCall('xeris_channels', 'cancel', { channel_id: 'c' }), OWNER), undefined);
+  await agent.callContract('pool1', 'cancel', { order_id: 'o' });
+  assert.deepEqual(sentIx(fetch), Instructions.agentExecute(OWNER, Instructions.contractCall('pool1', 'cancel', { order_id: 'o' })));
 });

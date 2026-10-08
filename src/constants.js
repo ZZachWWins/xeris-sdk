@@ -420,6 +420,43 @@ const PROTOCOL_CONTRACT_IDS = Object.freeze({
   heartbeats: 'xeris_heartbeats',
 });
 
+/**
+ * The node's deny list of protocol methods that a generic `ContractCall` may
+ * not reach, copied from `is_protected_contract_call` (`ledger.rs:2184-2320`),
+ * a pure function of the contract id and method. `prefixes` is checked first:
+ * a contract id that starts with one of its keys is sealed for exactly the
+ * listed methods (`ledger.rs:2199-2201, 2212-2214`); any other id is looked up
+ * in `contracts` (`ledger.rs:2215-2319`). The node applies it after charging
+ * the fee: a top-level ContractCall is skipped (`ledger.rs:5833-5837`), an
+ * AgentExecute inner call is skipped (`ledger.rs:6432-6435`) and a
+ * ConditionalOrder inner call cancels the order when it fires
+ * (`ledger.rs:9163-9166`). Each sealed method has a dedicated instruction.
+ * See `isProtectedContractCall`.
+ * @type {Readonly<{prefixes: Readonly<Record<string, ReadonlyArray<string>>>, contracts: Readonly<Record<string, ReadonlyArray<string>>>}>}
+ */
+const PROTECTED_CONTRACT_CALLS = Object.freeze({
+  prefixes: Object.freeze({
+    agent_registry_: Object.freeze(['validate_agent_tx', 'record_agent_spend']),
+    identity_: Object.freeze(['attest', 'record_activity']),
+  }),
+  contracts: Object.freeze({
+    xeris_identities: Object.freeze(['attest', 'record_activity']),
+    xeris_governance: Object.freeze(['propose', 'vote', 'execute']),
+    xeris_heartbeats: Object.freeze(['beat']),
+    xeris_models: Object.freeze(['register']),
+    xeris_conditional_orders: Object.freeze(['place_order', 'cancel_order', 'evaluate']),
+    xeris_zk_verifier: Object.freeze(['register_vk', 'submit_proof', 'verify_proof', 'record_nullifier', 'submit_attestation']),
+    xeris_pq_keys: Object.freeze(['register', 'rotate', 'record_pq_tx']),
+    xeris_slashing_registry: Object.freeze(['beat']),
+    xeris_disputes: Object.freeze(['open', 'resolve']),
+    xeris_deals: Object.freeze(['create', 'accept', 'confirm', 'cancel', 'reclaim', 'dispute', 'settle']),
+    xeris_devices: Object.freeze(['register', 'attest']),
+    xeris_channels: Object.freeze(['open', 'close', 'force_close']),
+    xeris_tasks: Object.freeze(['post', 'claim', 'submit_proof', 'verify', 'reject', 'cancel', 'expire_check']),
+    xeris_capabilities: Object.freeze(['register', 'update']),
+  }),
+});
+
 // ---------------------------------------------------------------------------
 // Deals, disputes, tasks, orders, oracles, governance, launchpad
 // ---------------------------------------------------------------------------
@@ -447,6 +484,22 @@ const MAX_ORDER_LIFETIME_SLOTS = 650_000;
 
 /** Maximum `ConditionalOrder.inner_instruction` length in bytes. `ledger.rs:6942`. */
 const MAX_CONDITIONAL_INNER_BYTES = 2048;
+
+/**
+ * Variant indices a ConditionalOrder inner instruction can have and still run
+ * when the order fires, ascending. The fire path acts on NativeTransfer (11,
+ * `ledger.rs:9098-9144`) and ContractCall (4, `ledger.rs:9145-9256`) and hands
+ * every other variant to `token::process_token_instruction`
+ * (`ledger.rs:9257-9272`), which acts only on TokenMint (0, `token.rs:1056`),
+ * TokenTransfer (1, `token.rs:1100`), TokenBurn (2, `token.rs:1147`),
+ * TokenCreate (3, `token.rs:1031`), TokenCreateRWA (6, `token.rs:1206`),
+ * RWAUpdateStatus (7, `token.rs:1258`) and RWATransfer (8, `token.rs:1296`).
+ * For every other variant it returns `Ok(())` without doing anything
+ * (`token.rs:1183-1199, 1333`), and the order is marked executed
+ * (`ledger.rs:9301`). Indices follow `token.rs:30-808`.
+ * @type {ReadonlyArray<number>}
+ */
+const CONDITIONAL_INNER_VARIANTS = Object.freeze([0, 1, 2, 3, 4, 6, 7, 8, 11]);
 
 /** Minimum `RegisterOracle.stake_amount` in lamports (1 XRS). `ledger.rs:7170`; `contracts.rs:4307`. */
 const MIN_ORACLE_STAKE_LAMPORTS = 1_000_000_000;
@@ -596,6 +649,7 @@ module.exports = {
   RESERVED_CONTRACT_ID_SUFFIXES,
   CONTRACT_ID_PATTERN,
   PROTOCOL_CONTRACT_IDS,
+  PROTECTED_CONTRACT_CALLS,
   MIN_DEAL_DISPUTE_BOND,
   DEAL_TIMEOUT_SLOTS,
   DISPUTE_CHALLENGE_PERIOD_SLOTS,
@@ -604,6 +658,7 @@ module.exports = {
   ORDER_STORAGE_BOND,
   MAX_ORDER_LIFETIME_SLOTS,
   MAX_CONDITIONAL_INNER_BYTES,
+  CONDITIONAL_INNER_VARIANTS,
   MIN_ORACLE_STAKE_LAMPORTS,
   MIN_VOTING_PERIOD_SLOTS,
   MAX_VOTING_PERIOD_SLOTS,
