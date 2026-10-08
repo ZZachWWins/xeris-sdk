@@ -1,4 +1,4 @@
-# xeris-sdk
+# xeris-sdk. Latest OCT 7th, 2026
 
 Official JavaScript SDK for the **XerisCoin (XRS)** Layer 1 blockchain.
 
