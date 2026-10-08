@@ -8,19 +8,25 @@
  * array of 64 integers (`src/bin/wallet.rs:96-105`, `src/bin/keypair_gen.rs:14-16`).
  * Addresses are the base58 public key (`src/bin/wallet.rs:106`).
  *
- * Signing uses `node:crypto` (Node >= 18 ships Ed25519); the signatures are the
- * same bytes `@solana/web3.js` produces for the same message, so `sign()` can
- * produce the detached co-signatures the node verifies with
- * `solana_sdk::signature::Signature::verify` (`src/contracts.rs:57-109`,
- * `src/ledger.rs:5299-5319`).
+ * Signing and verification use `@noble/curves` (pure JavaScript, the library
+ * `@solana/web3.js` itself signs with), so the module runs in browsers as well
+ * as Node. Ed25519 signing is deterministic (RFC 8032): the signatures are the
+ * same bytes `@solana/web3.js` and OpenSSL produce for the same key and
+ * message, so `sign()` can produce the detached co-signatures the node checks
+ * with `solana_sdk::signature::Signature::verify` (`src/contracts.rs:57-109`,
+ * `src/ledger.rs:5299-5319`). `verify()` applies the same acceptance rule as
+ * that function (see `verifyStrict`). The file helpers (`fromJsonFile`,
+ * `saveToFile`) load `fs` only when called; `package.json` maps `fs` to an
+ * empty module for browser bundlers.
  *
  * @module xeris-sdk/keypair
  */
 
+const { Buffer } = require('buffer');
 const { Keypair } = require('@solana/web3.js');
 const bs58 = require('bs58');
-const crypto = require('node:crypto');
-const fs = require('node:fs');
+const { ed25519 } = require('@noble/curves/ed25519');
+const { sha512 } = require('@noble/hashes/sha512');
 const { EncodingError } = require('./errors.js');
 
 /** Byte length of a Solana secret key (`Keypair::to_bytes()`, 32-byte seed ‖ 32-byte public key). */
@@ -37,18 +43,71 @@ const SIGNATURE_LEN = 64;
  */
 const MAX_BASE58_PUBKEY_LEN = 44;
 
-/**
- * PKCS#8 DER prefix for an Ed25519 private key (RFC 8410 §7): the 32-byte seed
- * follows these 16 bytes. `SEQUENCE { version 0, AlgorithmIdentifier { id-Ed25519 }, OCTET STRING { OCTET STRING seed } }`.
- */
-const PKCS8_ED25519_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
-/**
- * SubjectPublicKeyInfo DER prefix for an Ed25519 public key (RFC 8410 §4): the
- * 32-byte public key follows these 12 bytes.
- */
-const SPKI_ED25519_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+/** Order of the Ed25519 base point (`ℓ = 2^252 + 27742317777372353535851937790883648493`). */
+const ED25519_L = ed25519.CURVE.n;
+/** Edwards point class of `@noble/curves` 1.x. */
+const EdPoint = ed25519.ExtendedPoint;
 
 const INSPECT = Symbol.for('nodejs.util.inspect.custom');
+
+/**
+ * Loads Node's `fs` on first use, so that importing this module needs no
+ * file system (browser bundles map `fs` to an empty module through the
+ * `browser` field of `package.json`).
+ * @returns {typeof import('fs')}
+ * @throws {Error} When no file system is available (browser bundle).
+ */
+function fileSystem() {
+  const fs = require('fs');
+  if (!fs || typeof fs.readFileSync !== 'function') {
+    throw new Error('XerisKeypair file helpers need a Node.js file system (fs); load the key bytes and use fromSecretKey in a browser');
+  }
+  return fs;
+}
+
+/**
+ * Little-endian bytes to an unsigned BigInt.
+ * @param {Uint8Array} bytes
+ * @returns {bigint}
+ */
+function leToBigInt(bytes) {
+  let v = 0n;
+  for (let i = bytes.length - 1; i >= 0; i -= 1) v = (v << 8n) | BigInt(bytes[i]);
+  return v;
+}
+
+/**
+ * Ed25519 verification with the acceptance rule of
+ * `ed25519_dalek::PublicKey::verify_strict` 1.0.1, which
+ * `solana_signature::Signature::verify` calls (solana-signature 2.3.0
+ * `lib.rs:63-75`) and therefore every node signature check uses:
+ * `s` must be below ℓ; `R` and `A` must decompress and must not be of small
+ * order; and `[s]B - [k]A` must equal `R` with `k = SHA-512(R ‖ A ‖ M) mod ℓ`
+ * (cofactorless). Point decompression accepts the same encodings as
+ * curve25519-dalek.
+ * @param {Uint8Array} pk 32 bytes.
+ * @param {Uint8Array} msg
+ * @param {Uint8Array} sig 64 bytes.
+ * @returns {boolean}
+ */
+function verifyStrict(pk, msg, sig) {
+  const rBytes = sig.subarray(0, 32);
+  const s = leToBigInt(sig.subarray(32, 64));
+  if (s >= ED25519_L) return false;
+  let A;
+  let R;
+  try {
+    A = EdPoint.fromHex(pk, true);
+    R = EdPoint.fromHex(rBytes, true);
+  } catch (_) {
+    return false;
+  }
+  if (A.isSmallOrder() || R.isSmallOrder()) return false;
+  const h = sha512(Buffer.concat([rBytes, pk, msg]));
+  const k = leToBigInt(h) % ED25519_L;
+  const check = EdPoint.BASE.multiplyUnsafe(s).add(A.negate().multiplyUnsafe(k));
+  return check.equals(R);
+}
 
 /** @param {unknown} v @returns {boolean} */
 function isByteArray(v) {
@@ -124,14 +183,6 @@ function secretKeyBytes(secretKey) {
   return Uint8Array.from(secretKey);
 }
 
-/**
- * Builds a `node:crypto` KeyObject for a 32-byte Ed25519 public key.
- * @param {Buffer} pk 32 bytes.
- * @returns {crypto.KeyObject}
- */
-function publicKeyObject(pk) {
-  return crypto.createPublicKey({ key: Buffer.concat([SPKI_ED25519_PREFIX, pk]), format: 'der', type: 'spki' });
-}
 
 /**
  * Is `s` the canonical base58 form of a 32-byte public key? Mirrors the node's
@@ -176,7 +227,7 @@ function pubkeyBytes(s) {
  * An Ed25519 keypair in the node's `Keypair` format (64-byte secret key =
  * seed ‖ public key; address = base58 public key). Wraps `@solana/web3.js`
  * `Keypair` so `transaction.js` can sign with web3's legacy `Transaction`, and
- * exposes `sign`/`verify` over raw messages through `node:crypto`.
+ * exposes `sign`/`verify` over raw messages (`@noble/curves`).
  *
  * Secret bytes are never logged or stringified: `toJSON()` and `util.inspect`
  * show only the public key. Use `toJsonBytes()`/`secretKey` deliberately.
@@ -184,8 +235,6 @@ function pubkeyBytes(s) {
 class XerisKeypair {
   /** @type {Keypair} */
   #keypair;
-  /** @type {crypto.KeyObject|null} lazily built PKCS#8 private key for `sign()` */
-  #privateKeyObject = null;
 
   /**
    * Wraps an existing web3 `Keypair`.
@@ -257,7 +306,7 @@ class XerisKeypair {
    */
   static fromJsonFile(path) {
     if (typeof path !== 'string') throw new TypeError(`fromJsonFile: path must be a string, got ${describe(path)}`);
-    const text = fs.readFileSync(path, 'utf8');
+    const text = fileSystem().readFileSync(path, 'utf8');
     let parsed;
     try {
       parsed = JSON.parse(text);
@@ -331,7 +380,7 @@ class XerisKeypair {
     const mode = o.mode === undefined ? 0o600 : o.mode;
     if (typeof mode !== 'number' || !Number.isInteger(mode)) throw new TypeError(`saveToFile: mode must be an integer, got ${describe(mode)}`);
     if (mode < 0 || mode > 0o7777) throw new RangeError(`saveToFile: mode must be within 0..=0o7777, got ${mode}`);
-    fs.writeFileSync(path, JSON.stringify(this.toJsonBytes()), { mode, flag: 'w' });
+    fileSystem().writeFileSync(path, JSON.stringify(this.toJsonBytes()), { mode, flag: 'w' });
   }
 
   /**
@@ -346,19 +395,12 @@ class XerisKeypair {
    */
   sign(message) {
     const msg = messageBytes(message, 'message');
-    if (this.#privateKeyObject === null) {
-      const seed = Buffer.from(this.#keypair.secretKey.subarray(0, SEED_LEN));
-      this.#privateKeyObject = crypto.createPrivateKey({
-        key: Buffer.concat([PKCS8_ED25519_PREFIX, seed]),
-        format: 'der',
-        type: 'pkcs8',
-      });
-    }
-    return crypto.sign(null, msg, this.#privateKeyObject);
+    return Buffer.from(ed25519.sign(msg, this.#keypair.secretKey.subarray(0, SEED_LEN)));
   }
 
   /**
-   * Verifies a detached Ed25519 signature.
+   * Verifies a detached Ed25519 signature with the node's acceptance rule
+   * (`ed25519_dalek` `verify_strict`, see `verifyStrict`).
    * @param {string|Uint8Array|Buffer} publicKey Canonical base58 address or 32 raw bytes.
    * @param {Buffer|Uint8Array} message The signed bytes.
    * @param {Buffer|Uint8Array} signature 64 bytes.
@@ -371,7 +413,7 @@ class XerisKeypair {
     const pk = typeof publicKey === 'string' ? pubkeyBytes(publicKey) : fixedBytes(publicKey, PUBKEY_LEN, 'publicKey');
     const msg = messageBytes(message, 'message');
     const sig = fixedBytes(signature, SIGNATURE_LEN, 'signature');
-    return crypto.verify(null, msg, publicKeyObject(pk), sig);
+    return verifyStrict(pk, msg, sig);
   }
 
   /**

@@ -5,6 +5,8 @@
  * `npm test` glob is `test/*.test.js`).
  */
 
+const bs58 = require('bs58');
+const { Transaction, TransactionInstruction, PublicKey } = require('@solana/web3.js');
 const { XerisKeypair } = require('../src/keypair');
 
 /** Seed of the golden transaction vector (blueprint §9.4): 32 bytes of 0x07. */
@@ -26,11 +28,37 @@ function goldenKeypair() {
 }
 
 /**
+ * The unsigned golden transaction, assembled directly with web3.js in the
+ * layout `buildTransaction` produces. `buildTransaction` itself refuses it:
+ * its NativeTransfer pays 'Bob', which is not a canonical public key, and the
+ * node's semantic gate rejects that (ledger.rs:1417-1419, 1569-1577). The
+ * vector still pins the byte layout of the message and the signature.
+ * @returns {Transaction}
+ */
+function goldenUnsignedTx() {
+  const payer = new PublicKey(GOLDEN_PUBKEY);
+  const tx = new Transaction();
+  tx.add(new TransactionInstruction({
+    keys: [{ pubkey: payer, isSigner: true, isWritable: true }],
+    programId: new PublicKey(Buffer.alloc(32)),
+    data: Buffer.from(GOLDEN_IX_HEX, 'hex'),
+  }));
+  tx.feePayer = payer;
+  tx.recentBlockhash = bs58.encode(Buffer.from(GOLDEN_BLOCKHASH_HEX, 'hex'));
+  return tx;
+}
+
+/** A second canonical public key (seed 32 x 0x08), used as a valid transfer target. */
+const OTHER_PUBKEY = XerisKeypair.fromSeed(Buffer.alloc(32, 8)).publicKey;
+
+/**
  * Scripted `fetch` replacement. `routes` maps a matcher to a responder:
  * the first entry whose matcher returns true for `(url, init, parsedBody)`
  * answers. A responder returns `{ status?, body }` (`body` is JSON-encoded
  * unless it is a string) or a function result of the same shape. Every call
- * is recorded in `fetch.calls` as `{ url, method, headers, body }`.
+ * is recorded in `fetch.calls` as `{ url, method, headers, body, rawBody }`
+ * (`rawBody` is the exact request text; `body` is `JSON.parse` of it, which
+ * rounds integers above 2^53-1).
  * @param {Array<[(url: string, init: object, body: any) => boolean, any]>} routes
  * @returns {Function & { calls: object[] }}
  */
@@ -38,7 +66,7 @@ function mockFetch(routes) {
   const calls = [];
   const fn = async (url, init = {}) => {
     const body = init.body === undefined ? undefined : JSON.parse(init.body);
-    calls.push({ url, method: init.method, headers: init.headers, body });
+    calls.push({ url, method: init.method, headers: init.headers, body, rawBody: init.body });
     for (const [match, respond] of routes) {
       if (match(url, init, body)) {
         const r = typeof respond === 'function' ? respond(url, init, body) : respond;
@@ -71,6 +99,8 @@ module.exports = {
   GOLDEN_TX_HEX,
   GOLDEN_SIGNATURE,
   goldenKeypair,
+  goldenUnsignedTx,
+  OTHER_PUBKEY,
   mockFetch,
   rpc,
   route,

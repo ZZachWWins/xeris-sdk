@@ -56,7 +56,8 @@ const {
   encodeVariant,
 } = require('../encoding');
 const { EncodingError } = require('../errors');
-const { createHash } = require('node:crypto');
+const { Buffer } = require('buffer');
+const { sha256 } = require('@noble/hashes/sha256');
 
 // Variant indices = declaration order of `enum XerisInstruction` (token.rs:30).
 // The line cited on each entry is the variant's declaration.
@@ -405,7 +406,7 @@ function reclaimDeal(dealId, instance) {
 function dealTermsHash(terms) {
   assertArity(arguments.length, 1, 'dealTermsHash', 'terms');
   const text = assertString(terms, 'terms');
-  return createHash('sha256').update(Buffer.from(text, 'utf8')).digest();
+  return Buffer.from(sha256(Buffer.from(text, 'utf8')));
 }
 
 // ---------------------------------------------------------------------------

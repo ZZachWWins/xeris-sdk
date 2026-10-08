@@ -54,7 +54,6 @@ const {
 /** Keys `findTasks` accepts; anything else is refused rather than ignored. */
 const TASK_FILTER_KEYS = Object.freeze(['category', 'status', 'tag']);
 
-const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 /**
  * Short description of a value for error messages (never prints key material).
@@ -108,53 +107,7 @@ function assertArity(actual, expected, name, fields) {
   }
 }
 
-/**
- * Converts a u64 field value into a JSON number for a delegated
- * `ContractCall` args object. The node reads these with `as_u64` from a JSON
- * number (`ledger.rs:2139`; `contracts.rs:2218-2224, 2381-2383`), and
- * `JSON.stringify` cannot carry an integer above 2^53-1 exactly, so larger
- * values are refused rather than rounded (blueprint §7.3).
- * @param {number|bigint} value
- * @param {string} field
- * @returns {number}
- * @throws {TypeError|RangeError}
- */
-function jsonU64(value, field) {
-  const v = normalizeU64(value, field);
-  if (v > MAX_SAFE_BIGINT) {
-    throw new RangeError(`${field}: JSON numbers above 2^53-1 cannot be carried exactly (the node reads a JSON number with as_u64); got ${v}`);
-  }
-  return Number(v);
-}
 
-/**
- * Deep-copies a caller-supplied JSON args object, converting `bigint` to a
- * JSON-safe number and refusing anything `JSON.stringify` would silently
- * alter or drop: non-finite numbers (become `null`), `undefined`, functions
- * and symbols (keys vanish), non-plain objects, and strings with a lone
- * surrogate (`serde_json` rejects the `\uD800` escape).
- * @param {unknown} value
- * @param {string} path field path for error messages
- * @returns {unknown}
- * @throws {TypeError|RangeError}
- */
-function jsonValue(value, path) {
-  if (typeof value === 'bigint') return jsonU64(value, path);
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new RangeError(`${path}: JSON cannot carry ${String(value)}`);
-    return value;
-  }
-  if (typeof value === 'string') return assertString(value, path);
-  if (typeof value === 'boolean' || value === null) return value;
-  if (Array.isArray(value)) return value.map((v, i) => jsonValue(v, `${path}[${i}]`));
-  if (value !== null && typeof value === 'object') {
-    if (!isPlainObject(value)) throw new TypeError(`${path}: expected a plain object or array, got ${describe(value)}`);
-    const out = {};
-    for (const key of Object.keys(value)) out[key] = jsonValue(value[key], `${path}.${key}`);
-    return out;
-  }
-  throw new TypeError(`${path}: ${typeof value} cannot be serialised to JSON`);
-}
 
 /**
  * Value of `process.env[MAINNET_HOST_ENV]`, or `null` when unset or empty
@@ -411,20 +364,23 @@ class XerisAgent {
   /**
    * Wraps `innerInstruction` in AgentExecute (variant 17) for the owner and
    * submits it signed by the agent key. `checks.agentInner` applies the
-   * node's allow-list first (`ledger.rs:6425-6485, 2138-2175`): inner
-   * variants outside `AGENT_INNER_VARIANTS` → `RangeError`; Stake/Unstake →
+   * node's rules first (`ledger.rs:6399-6485, 2138-2175`): inner bytes that
+   * do not decode as a `XerisInstruction` → `EncodingError`; inner
+   * variants outside `AGENT_INNER_VARIANTS` → `RangeError`; an inner
+   * TokenTransfer/TokenBurn whose `from` is not the owner → `RangeError`
+   * (`ledger.rs:6522, 6648-6655`); Stake/Unstake →
    * `FeatureDisabledError('agentStake')`; a ContractCall with non-object
    * args, a method outside `DELEGATED_CALL_METHODS` or an `agent_registry_`
    * target → `FeatureDisabledError`/`XerisError`. Nested AgentExecute or
    * ConditionalOrder is rejected at ingress (`ledger.rs:1439`).
    * @param {Buffer|Uint8Array} innerInstruction encoded inner instruction
    * @returns {Promise<SubmitResult>}
-   * @throws {TypeError|RangeError|FeatureDisabledError|XerisError|RpcError}
+   * @throws {TypeError|EncodingError|RangeError|FeatureDisabledError|XerisError|RpcError}
    */
   async execute(innerInstruction) {
     assertArity(arguments.length, 1, 'XerisAgent.execute', 'innerInstruction');
     const inner = toBytes(innerInstruction, 'innerInstruction');
-    checks.agentInner(inner);
+    checks.agentInner(inner, this._ownerPubkey);
     return this._send(Instructions.agentExecute(this._ownerPubkey, inner));
   }
 
@@ -533,8 +489,9 @@ class XerisAgent {
    * and executes as the owner. Launchpad and RWA contracts are rejected on
    * this path (`ledger.rs:6554-6561`), as are `confirm`/`verify` and any
    * method not in the table; `checks.agentInner` refuses those it can see
-   * before signing. `bigint` values are converted to JSON numbers when
-   * ≤ 2^53-1, otherwise refused.
+   * before signing. `args` is written by `stringifyJson`: `bigint` values
+   * become exact JSON integers; an integer `number` above 2^53-1,
+   * `NaN`/`Infinity`, `undefined` and functions throw.
    * @param {string} contractId not starting with `agent_registry_` (`ledger.rs:6428-6431`)
    * @param {string} method one of `DELEGATED_CALL_METHODS`
    * @param {object} args plain object; shapes in blueprint §7.3
@@ -549,7 +506,7 @@ class XerisAgent {
     if (!isPlainObject(args)) {
       throw new TypeError(`args: a delegated ContractCall takes a plain object (JSON); raw bytes are rejected by the node (ledger.rs:6436-6441); got ${describe(args)}`);
     }
-    return this.execute(Instructions.contractCall(contractId, method, jsonValue(args, 'args')));
+    return this.execute(Instructions.contractCall(contractId, method, args));
   }
 
   /**
@@ -569,11 +526,11 @@ class XerisAgent {
     assertArity(arguments.length, 6, 'XerisAgent.addLiquidity', 'poolId, amountA, amountB, minLpShares, minAmountA, minAmountB');
     assertString(poolId, 'poolId');
     const args = {
-      amount_a: jsonU64(amountA, 'amountA'),
-      amount_b: jsonU64(amountB, 'amountB'),
-      min_lp_shares: jsonU64(minLpShares, 'minLpShares'),
-      min_amount_a: jsonU64(minAmountA, 'minAmountA'),
-      min_amount_b: jsonU64(minAmountB, 'minAmountB'),
+      amount_a: normalizeU64(amountA, 'amountA'),
+      amount_b: normalizeU64(amountB, 'amountB'),
+      min_lp_shares: normalizeU64(minLpShares, 'minLpShares'),
+      min_amount_a: normalizeU64(minAmountA, 'minAmountA'),
+      min_amount_b: normalizeU64(minAmountB, 'minAmountB'),
     };
     checks.liquidityArgs(args);
     return this.callContract(poolId, 'add_liquidity', args);
@@ -594,9 +551,9 @@ class XerisAgent {
     assertString(poolId, 'poolId');
     checks.positive(shares, 'shares');
     const args = {
-      shares: jsonU64(shares, 'shares'),
-      min_amount_a: jsonU64(minAmountA, 'minAmountA'),
-      min_amount_b: jsonU64(minAmountB, 'minAmountB'),
+      shares: normalizeU64(shares, 'shares'),
+      min_amount_a: normalizeU64(minAmountA, 'minAmountA'),
+      min_amount_b: normalizeU64(minAmountB, 'minAmountB'),
     };
     return this.callContract(poolId, 'remove_liquidity', args);
   }

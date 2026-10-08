@@ -482,6 +482,12 @@ const ACCOUNT_HISTORY_MAX_PAGE = 50;
 /** Maximum `page_size` on numbered list routes (`paginate` clamps to 1..100). `explorer.rs:276-299`. */
 const LIST_MAX_PAGE_SIZE = 100;
 
+/** Maximum `limit` of JSON-RPC `getSignaturesForAddress`; the store clamps to 1..`MAX_PAGE`. `tx_store.rs:57, 351`. */
+const SIGNATURES_MAX_LIMIT = 200;
+
+/** Maximum `limit` of `GET /price-history`; the node applies `.min(10_080)`. `network.rs:6030-6033`. */
+const PRICE_HISTORY_MAX_LIMIT = 10080;
+
 /**
  * `status` values the explorer reports for a transaction: `confirmed`,
  * `failed`, `partial` from the receipt store (`tx_store.rs:116-120`) and
@@ -608,6 +614,8 @@ module.exports = {
   ACCOUNT_HISTORY_MAX_PAGE_SIZE,
   ACCOUNT_HISTORY_MAX_PAGE,
   LIST_MAX_PAGE_SIZE,
+  SIGNATURES_MAX_LIMIT,
+  PRICE_HISTORY_MAX_LIMIT,
   TX_STATUSES,
   STRING_LIMITS,
 };

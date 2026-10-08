@@ -23,6 +23,7 @@
  * Nothing here touches the network.
  */
 
+const { Buffer } = require('buffer');
 const { Instructions, Variant, encodeSwapCall, dealTermsHash } = require('./instructions/index.js');
 
 /**

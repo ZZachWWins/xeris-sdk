@@ -307,7 +307,9 @@ test('DISABLED_FEATURES messages name the replacement path (blueprint §4)', () 
   assert.equal(DISABLED_FEATURES.governanceRpcWrite.message, 'POST /governance/vote and /governance/propose return HTTP 501 (NEW-CRIT-6). Use the on-chain instructions CreateProposal (39), CastVote (40), ExecuteProposal (41) via POST /submit.');
   assert.equal(DISABLED_FEATURES.governanceLock.message, 'POST /governance/lock and /governance/delegate return HTTP 501 (NEW-CRIT-6). No on-chain lock or delegation instruction exists; GET /governance/lock/{address} remains readable.');
   assert.equal(DISABLED_FEATURES.governanceLock.replacement, null);
-  assert.deepEqual(Object.keys(DISABLED_FEATURES).sort(), ['SubDelegate', 'ZkIdentityProof', 'ZkPrivateTransfer', 'PqSignedTransfer', 'agentDelegatedMethod', 'agentLaunchpad', 'agentRwa', 'agentStake', 'agentSwap', 'airdrop', 'governanceLock', 'governanceRpcWrite', 'stakeClaim'].sort());
+  assert.equal(DISABLED_FEATURES.QueryCapabilities.replacement, 'XerisClient.searchCapabilities');
+  assert.equal(DISABLED_FEATURES.QueryCapabilities.citation, 'ledger.rs:7460-7464');
+  assert.deepEqual(Object.keys(DISABLED_FEATURES).sort(), ['SubDelegate', 'QueryCapabilities', 'ZkIdentityProof', 'ZkPrivateTransfer', 'PqSignedTransfer', 'agentDelegatedMethod', 'agentLaunchpad', 'agentRwa', 'agentStake', 'agentSwap', 'airdrop', 'governanceLock', 'governanceRpcWrite', 'stakeClaim'].sort());
   assert.ok(Object.isFrozen(DISABLED_FEATURES));
 });
 
@@ -437,7 +439,31 @@ test('contractCall: plain object is JSON-encoded, Buffer/Uint8Array are raw, any
   for (const bad of [[1, 2, 3], 5, null, undefined, true, [], 'abcd', '"s"', '[1]', new Date(), new Map()]) {
     assert.throws(() => Instructions.contractCall('c', 'm', bad), TypeError, `args ${String(bad)}`);
   }
-  assert.throws(() => Instructions.contractCall('c', 'm', { a: 1n }), TypeError);  // JSON.stringify cannot carry bigint
+  // bigint is written as exact JSON digits (the node reads u64 with as_u64, exact to 2^64-1).
+  const big = Instructions.contractCall('lp', 'buy_tokens', { xrs_amount: 50_000_000_000n, min_tokens_out: 15488583466903808n });
+  assert.ok(big.toString('utf8').endsWith('{"xrs_amount":50000000000,"min_tokens_out":15488583466903808}'));
+  assert.ok(Instructions.contractCall('c', 'm', { a: 18446744073709551615n }).toString('utf8').endsWith('{"a":18446744073709551615}'));
+  // Values JSON.stringify would silently change are refused (review: slippage floor removed on the node).
+  for (const [args, E] of [
+    [{ xrs_amount: 1000, min_tokens_out: NaN }, RangeError],
+    [{ xrs_amount: 1000, min_tokens_out: Infinity }, RangeError],
+    [{ xrs_amount: 1000, min_tokens_out: undefined }, TypeError],
+    [{ xrs_amount: 9007199254740993 }, RangeError],
+    [{ xrs_amount: 2 ** 64 }, RangeError],
+    [{ a: 2n ** 64n }, RangeError],
+    [{ f: () => 1 }, TypeError],
+    [{ note: '\uD800' }, RangeError],
+    [{ ['\uDC00']: 1 }, RangeError],
+    [{ b: Buffer.alloc(2) }, TypeError],
+    [{ d: new Date(0) }, TypeError],
+  ]) {
+    assert.throws(() => Instructions.contractCall('lp', 'buy_tokens', args), E, JSON.stringify(Object.keys(args)));
+  }
+  // The string path is checked the way serde_json reads it.
+  assert.throws(() => Instructions.contractCall('c', 'm', '{"note":"\\ud800"}'), RangeError);
+  assert.throws(() => Instructions.contractCall('c', 'm', '{"a":1e400}'), RangeError);
+  assert.throws(() => Instructions.contractCall('c', 'm', '{"a":18446744073709551616}'), RangeError);
+  assert.ok(Instructions.contractCall('c', 'm', '{"a":18446744073709551615}').toString('utf8').endsWith('{"a":18446744073709551615}'));
 });
 
 test('encodeSwapCall: ContractCall with 16 raw LE bytes (input_amount ‖ min_output)', () => {
@@ -637,6 +663,24 @@ test('fromPlan rejects unknown variants, missing params and unsafe numbers', () 
   assert.throws(() => fromPlan({ variant_index: 4, params: { contract_id: 'p', method: 'swap_a_to_b', args: 'abcd' } }), TypeError);
 });
 
+test('fromPlan applies the u64 range to buy_tokens args (contracts.rs:2847-2850)', () => {
+  const buy = (args) => ({ variant_index: 4, params: { contract_id: 'lp_x', method: 'buy_tokens', args } });
+  const negative = (e) => e instanceof RangeError && /expected an unsigned integer >= 0/.test(e.message);
+  // A negative min_tokens_out reads as None under as_u64() and becomes 0: no slippage floor.
+  assert.throws(() => fromPlan(buy({ xrs_amount: 1000, min_tokens_out: -5 })), (e) => negative(e) && /params\.args\.min_tokens_out/.test(e.message));
+  assert.throws(() => fromPlan(buy({ xrs_amount: 1000, min_tokens_out: -5n })), (e) => negative(e) && /params\.args\.min_tokens_out/.test(e.message));
+  assert.throws(() => fromPlan(buy({ xrs_amount: -1000, min_tokens_out: 1 })), (e) => negative(e) && /params\.args\.xrs_amount/.test(e.message));
+  assert.throws(() => fromPlan(buy({ xrs_amount: -1000n, min_tokens_out: 1 })), (e) => negative(e) && /params\.args\.xrs_amount/.test(e.message));
+  assert.throws(() => fromPlan(buy({ xrs_amount: 1, min_tokens_out: 2n ** 64n })), (e) => e instanceof RangeError && /<= 18446744073709551615/.test(e.message));
+  assert.throws(() => fromPlan(buy({ xrs_amount: 2n ** 64n, min_tokens_out: 1 })), (e) => e instanceof RangeError && /params\.args\.xrs_amount/.test(e.message));
+  assert.throws(() => fromPlan(buy({ xrs_amount: 1.5, min_tokens_out: 1 })), (e) => e instanceof RangeError && !/lost precision/.test(e.message));
+  assert.throws(() => fromPlan(buy({ xrs_amount: 2 ** 60, min_tokens_out: 1 })), (e) => e instanceof RangeError && /lost precision/.test(e.message));
+  assert.throws(() => fromPlan(buy({ xrs_amount: '1', min_tokens_out: 1 })), TypeError);
+  assert.throws(() => fromPlan({ variant_index: 11, params: { from: 'A', to: 'B', amount: -1n } }), RangeError);
+  assert.equal(hex(fromPlan(buy({ xrs_amount: 0, min_tokens_out: 2n ** 64n - 1n }))),
+    hex(Instructions.contractCall('lp_x', 'buy_tokens', { xrs_amount: 0, min_tokens_out: 2n ** 64n - 1n })));
+});
+
 // ---------------------------------------------------------------------------
 // Module surface
 // ---------------------------------------------------------------------------
@@ -644,7 +688,8 @@ test('fromPlan rejects unknown variants, missing params and unsafe numbers', () 
 test('instructions/index.js exports exactly the names in the cross-module contract', () => {
   assert.deepEqual(Object.keys(ix).sort(), [
     'BUILDER_NAMES', 'Instructions', 'VARIANT_NAMES', 'Variant', '_raw', 'buildPqRotationMessage',
-    'channelCloseMessage', 'channelStateMessage', 'dealTermsHash', 'encodeSwapCall', 'fromPlan', 'isDisabledVariant',
+    'channelCloseMessage', 'channelStateMessage', 'dealTermsHash', 'encodeSwapCall', 'fromPlan', 'hardwareAttestChallenge',
+    'isDisabledVariant', 'VARIANT_FIELDS', 'decodeInstruction', 'tryDecodeInstruction',
   ].sort());
   assert.equal(typeof dealTermsHash, 'function');
   assert.equal(typeof buildPqRotationMessage, 'function');
@@ -658,4 +703,84 @@ test('builders are plain functions with no `this` dependency', () => {
   const { nativeTransfer, acceptDeal } = Instructions;
   assert.equal(hex(nativeTransfer('Alice', 'Bob', 5_000_000_000)), '0b0000000500000000000000416c6963650300000000000000426f6200f2052a01000000');
   assert.ok(Buffer.isBuffer(acceptDeal('d', 1, 'a', 1, Buffer.alloc(32))));
+});
+
+// ---------------------------------------------------------------------------
+// hardwareAttestChallenge (ledger.rs:5299-5319) and exact plan amounts
+// ---------------------------------------------------------------------------
+
+test('hardwareAttestChallenge mirrors hw_attest_challenge byte for byte', () => {
+  const { hardwareAttestChallenge } = ix;
+  const lp = (b) => { const n = Buffer.alloc(4); n.writeUInt32LE(b.length); return Buffer.concat([n, b]); };
+  const u64 = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v)); return b; };
+  const device = 'GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB';
+  const deviceKey = Buffer.from(require('bs58').decode(device));
+  const expected = Buffer.concat([
+    Buffer.from('XRS_HW_ATTEST_V2'),
+    Buffer.from([1]), deviceKey,                       // push_identity: parses as a Pubkey
+    Buffer.from([0]), lp(Buffer.from('')),             // push_identity: empty bound identity
+    lp(Buffer.from('iot')), lp(Buffer.from('Acme')), lp(Buffer.from('M1')), lp(Buffer.from('1.0.0')),
+    u64(123456789n),
+  ]);
+  assert.equal(hex(hardwareAttestChallenge(device, '', 'iot', 'Acme', 'M1', '1.0.0', 123456789n)), hex(expected));
+  assert.throws(() => hardwareAttestChallenge(device, '', 'iot', 'Acme', 'M1', '1.0.0'), EncodingError);
+  assert.throws(() => hardwareAttestChallenge(device, '', 'iot', 'Acme', 'M1', '1.0.0', -1), RangeError);
+});
+
+test('fromPlan encodes bigint launchpad args exactly and refuses rounded or unknown ones', () => {
+  const plan = (args, method = 'buy_tokens') => ({ variant_index: 4, variant_name: 'ContractCall', params: { contract_id: 'lp_x', method, args } });
+  const out = fromPlan(plan({ xrs_amount: 50000000000, min_tokens_out: 15488583466903809n }));
+  assert.ok(out.toString('utf8').endsWith('{"xrs_amount":50000000000,"min_tokens_out":15488583466903809}'));
+  assert.throws(() => fromPlan(plan({ xrs_amount: 50000000000, min_tokens_out: 15488583466903808 })), RangeError);
+  assert.throws(() => fromPlan(plan({ xrs_amount: 1, min_tokens_out: 1, extra: 1 })), TypeError);
+  assert.throws(() => fromPlan(plan({ xrs_amount: 1 })), TypeError);
+  assert.throws(() => fromPlan(plan({ xrs_amount: 1, min_tokens_out: 1 }, 'sell_tokens')), TypeError);
+  assert.throws(() => fromPlan(plan({ xrs_amount: '1', min_tokens_out: 1 })), TypeError);
+});
+
+// ---------------------------------------------------------------------------
+// Strict decoder (bincode::deserialize::<XerisInstruction>)
+// ---------------------------------------------------------------------------
+
+test('VARIANT_FIELDS equals the independent SCHEMA transcription of token.rs', () => {
+  assert.equal(ix.VARIANT_FIELDS.length, 62);
+  for (let i = 0; i < 62; i += 1) {
+    assert.deepEqual(ix.VARIANT_FIELDS[i].map((f) => [...f]), SCHEMA[i][2], `variant ${i}`);
+  }
+});
+
+test('decodeInstruction reads every vector back to its fields', () => {
+  const asJson = (type, v) => {
+    if (v === null) return null;
+    const t = type.replace(/^\?/, '');
+    if (t === 'u64') return v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : String(v);
+    if (t === 'B' || t === 'B32') return hex(v);
+    return v;
+  };
+  for (const v of VECTORS) {
+    const d = ix.decodeInstruction(Buffer.from(v.hex, 'hex'));
+    assert.ok(d !== null, `${v.index}/${v.label}`);
+    assert.equal(d.variant, v.index);
+    assert.equal(d.name, v.variant);
+    assert.equal(d.byteLength, v.length);
+    const got = Object.fromEntries(ix.VARIANT_FIELDS[v.index].map(([name, type]) => [name, asJson(type, d.fields[name])]));
+    assert.deepEqual(got, v.fields, `${v.index}/${v.label}`);
+  }
+});
+
+test('decodeInstruction refuses what bincode refuses and ignores trailing bytes', () => {
+  const ok = Instructions.updateIdentity('k', null, 'm', true);
+  assert.deepEqual(ix.decodeInstruction(Buffer.concat([ok, Buffer.from([9, 9])])).fields, {
+    identity_pubkey: 'k', new_display_name: null, new_metadata: 'm', deactivated: true,
+  });
+  for (let n = 0; n < ok.length; n += 1) assert.equal(ix.decodeInstruction(ok.subarray(0, n)), null, `truncated to ${n}`);
+  const flip = (offset, byte) => { const b = Buffer.from(ok); b[offset] = byte; return b; };
+  assert.match(ix.tryDecodeInstruction(flip(13, 2)).reason, /new_display_name: invalid Option tag 0x02/);
+  assert.match(ix.tryDecodeInstruction(flip(ok.length - 1, 2)).reason, /deactivated: invalid bool byte 0x02/);
+  assert.match(ix.tryDecodeInstruction(flip(12, 0xff)).reason, /identity_pubkey: String is not valid UTF-8/);
+  assert.match(ix.tryDecodeInstruction(u32le(62)).reason, /variant index 62/);
+  assert.match(ix.tryDecodeInstruction(Buffer.alloc(3)).reason, /needs 4/);
+  // A UTF-8 BOM is valid UTF-8 and is kept, as str::from_utf8 keeps it.
+  assert.equal(ix.decodeInstruction(Instructions.cancelConditionalOrder('﻿x')).fields.order_id, '﻿x');
+  assert.throws(() => ix.decodeInstruction('0b000000'), TypeError);
 });

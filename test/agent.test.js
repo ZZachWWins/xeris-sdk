@@ -6,7 +6,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Transaction } = require('@solana/web3.js');
 
-const { XerisAgent, XerisKeypair, Instructions, FeatureDisabledError, XerisError, AGENT_INNER_VARIANTS } = require('..');
+const { XerisAgent, XerisKeypair, Instructions, FeatureDisabledError, XerisError, EncodingError, AGENT_INNER_VARIANTS } = require('..');
 const H = require('./_helpers');
 
 const BOB = '11111111111111111111111111111112';
@@ -56,6 +56,15 @@ test('execute rejects inner variants outside the allow-list and the no-op stake 
   assert.equal(fetch.calls.length, 0);
 });
 
+test('execute refuses delegated ContractCall args serde_json rejects (ledger.rs:6436-6442)', async () => {
+  const { agent, fetch } = make();
+  for (const text of ['{"amount_a":1e400}', '{"amount_a":1,"x":"\\ud800"}', '{"amount_a":18446744073709551616}']) {
+    const inner = Instructions.contractCall('pool', 'add_liquidity', Buffer.from(text));
+    await assert.rejects(agent.execute(inner), (e) => e instanceof XerisError && /ledger\.rs:6436-6442/.test(e.message), text);
+  }
+  assert.equal(fetch.calls.length, 0);
+});
+
 test('stubs throw FeatureDisabledError synchronously', () => {
   const { agent, fetch } = make();
   for (const name of ['swapTokens', 'buyOnLaunchpad', 'sellOnLaunchpad', 'stakeXrs', 'unstakeXrs', 'subDelegate']) {
@@ -83,4 +92,39 @@ test('planStake posts the owner key; findTasks filters the task list', async () 
   assert.deepEqual((await agent.findTasks({ category: 'x' })).map((t) => t.task_id), ['a']);
   assert.deepEqual((await agent.findTasks({ tag: 'gpu' })).map((t) => t.task_id), ['a']);
   await assert.rejects(agent.findTasks({ colour: 'x' }), RangeError);
+});
+
+test('delegated JSON args carry bigint exactly and refuse values JSON.stringify would change', async () => {
+  const { agent, fetch } = make();
+  await agent.addLiquidity('pool1', 10n ** 16n, 2n ** 63n, 1, 1, 1);
+  const inner = Instructions.contractCall('pool1', 'add_liquidity', {
+    amount_a: 10n ** 16n, amount_b: 2n ** 63n, min_lp_shares: 1, min_amount_a: 1, min_amount_b: 1,
+  });
+  assert.deepEqual(sentIx(fetch), Instructions.agentExecute(OWNER, inner));
+  assert.ok(inner.toString('utf8').endsWith('{"amount_a":10000000000000000,"amount_b":9223372036854775808,"min_lp_shares":1,"min_amount_a":1,"min_amount_b":1}'));
+  await assert.rejects(agent.callContract('pool1', 'remove_liquidity', { shares: 1, min_amount_a: undefined, min_amount_b: 1 }), TypeError);
+  await assert.rejects(agent.callContract('pool1', 'remove_liquidity', { shares: 2 ** 60, min_amount_a: 1, min_amount_b: 1 }), RangeError);
+});
+
+test('execute refuses inner bytes that do not decode, before any I/O (ledger.rs:6399-6405)', async () => {
+  const { agent, fetch } = make();
+  const badTo = Buffer.concat([Buffer.from([11, 0, 0, 0]), Buffer.from('0100000000000000', 'hex'), Buffer.from('a'),
+    Buffer.from('0100000000000000ff', 'hex'), Buffer.alloc(8)]);
+  for (const inner of [Buffer.from([11, 0, 0, 0]), Buffer.from([13, 0, 0, 0, 1, 2]), badTo, Buffer.alloc(0)]) {
+    await assert.rejects(agent.execute(inner), (e) => e instanceof EncodingError && /does not decode as a XerisInstruction.*ledger\.rs:6399-6405/.test(e.message), inner.toString('hex'));
+  }
+  const badContract = Buffer.concat([Buffer.from([4, 0, 0, 0]), Buffer.from('0100000000000000ff', 'hex'),
+    Buffer.from('0d00000000000000', 'hex'), Buffer.from('add_liquidity'), Buffer.from('0200000000000000', 'hex'), Buffer.from('{}')]);
+  await assert.rejects(agent.execute(badContract), (e) => e instanceof EncodingError && /ContractCall\.contract_id: String is not valid UTF-8/.test(e.message));
+  assert.equal(fetch.calls.length, 0);
+});
+
+test('execute refuses an inner TokenTransfer/TokenBurn whose from is not the owner (ledger.rs:6522, 6648-6655)', async () => {
+  const { agent, fetch } = make();
+  const third = XerisKeypair.generate().publicKey;
+  await assert.rejects(agent.execute(Instructions.tokenTransfer('tok', third, BOB, 5)), (e) => e instanceof RangeError && /nested TokenTransfer\.from .* is not the AgentExecute owner .*token\.rs:1104/.test(e.message));
+  await assert.rejects(agent.execute(Instructions.tokenBurn('tok', third, 5)), (e) => e instanceof RangeError && /nested TokenBurn\.from .* is not the AgentExecute owner .*token\.rs:1151/.test(e.message));
+  assert.equal(fetch.calls.length, 0);
+  await agent.execute(Instructions.tokenBurn('tok', OWNER, 5));
+  assert.deepEqual(sentIx(fetch), Instructions.agentExecute(OWNER, Instructions.tokenBurn('tok', OWNER, 5)));
 });

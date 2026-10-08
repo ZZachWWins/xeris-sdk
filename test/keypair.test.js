@@ -84,3 +84,47 @@ test('isCanonicalPubkey mirrors the base58 round-trip rule (ledger.rs:1569-1577)
   assert.equal(isCanonicalPubkey(`1${H.GOLDEN_PUBKEY}`), false, 'leading 1 changes the decoded length');
   assert.throws(() => pubkeyBytes('Alice'), EncodingError);
 });
+
+// ---------------------------------------------------------------------------
+// Pure-JavaScript Ed25519 (browser-capable) with the node's verify rule
+// ---------------------------------------------------------------------------
+
+test('sign() is byte-identical to OpenSSL Ed25519 and verify() accepts it', () => {
+  const crypto = require('node:crypto');
+  for (let i = 0; i < 40; i += 1) {
+    const seed = crypto.randomBytes(32);
+    const kp = XerisKeypair.fromSeed(seed);
+    const msg = crypto.randomBytes(i * 7);
+    const priv = crypto.createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]), format: 'der', type: 'pkcs8' });
+    const sig = kp.sign(msg);
+    assert.deepEqual(sig, crypto.sign(null, msg, priv));
+    assert.equal(XerisKeypair.verify(kp.publicKey, msg, sig), true);
+    const bad = Buffer.from(sig);
+    bad[i % 64] ^= 0x01;
+    assert.equal(XerisKeypair.verify(kp.publicKeyBytes, msg, bad), false);
+  }
+});
+
+test('verify() applies ed25519-dalek verify_strict: s < l, no small-order keys or R', () => {
+  const L = 2n ** 252n + 27742317777372353535851937790883648493n;
+  const kp = H.goldenKeypair();
+  const msg = Buffer.from('xeris');
+  const sig = kp.sign(msg);
+  // s + l verifies under a cofactored or non-reducing check; the node refuses it.
+  let s = 0n;
+  for (let i = 63; i >= 32; i -= 1) s = (s << 8n) | BigInt(sig[i]);
+  const s2 = s + L;
+  const mall = Buffer.from(sig);
+  for (let i = 0; i < 32; i += 1) mall[32 + i] = Number((s2 >> BigInt(8 * i)) & 0xffn);
+  assert.equal(XerisKeypair.verify(kp.publicKey, msg, mall), false);
+  // Identity public key and identity R with s = 0 satisfy [s]B = R + [k]A; dalek rejects small order.
+  const identity = Buffer.alloc(32);
+  identity[0] = 1;
+  assert.equal(XerisKeypair.verify(identity, msg, Buffer.concat([identity, Buffer.alloc(32)])), false);
+});
+
+test('the keypair module loads no file system until a file helper is called', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'keypair.js'), 'utf8');
+  assert.doesNotMatch(src, /require\(['"]node:/);
+  assert.doesNotMatch(src.split('function fileSystem()')[0], /require\(['"]fs['"]\)/);
+});

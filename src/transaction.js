@@ -37,9 +37,10 @@
  * @module xeris-sdk/transaction
  */
 
+const { Buffer } = require('buffer');
 const { Transaction, TransactionInstruction, PublicKey } = require('@solana/web3.js');
 const bs58 = require('bs58');
-const { readVariant } = require('./encoding.js');
+const { readVariant, parseJson, isPlainJsonObject } = require('./encoding.js');
 const { XerisError, EncodingError, RpcError, DISABLED_FEATURES, disabledFeature } = require('./errors.js');
 const {
   INSTRUCTION_COUNT,
@@ -48,8 +49,12 @@ const {
   MAX_SLASH_IX_DATA_SIZE,
   MAX_IX_PER_TX,
   MAX_TX_BYTES,
+  AGENT_INNER_VARIANTS,
+  CONDITION_TYPES,
+  MAX_CONDITIONAL_INNER_BYTES,
 } = require('./constants.js');
 const { XerisKeypair, isCanonicalPubkey } = require('./keypair.js');
+const { decodeInstruction, tryDecodeInstruction, VARIANT_NAMES } = require('./instructions/index.js');
 
 /**
  * Variant index of `XerisInstruction::SlashReport` (`src/token.rs:524`), the
@@ -59,14 +64,25 @@ const { XerisKeypair, isCanonicalPubkey } = require('./keypair.js');
 const SLASH_REPORT_VARIANT = 38;
 
 /**
- * Variant index -> `DISABLED_FEATURES` key for every entry of
- * `DISABLED_VARIANTS`. The keys are the PascalCase Rust variant names.
+ * Variant index of `XerisInstruction::QueryCapabilities` (`src/token.rs:414`).
+ * Its builder encodes it (the node decodes it), but the block dispatcher's arm
+ * is empty (`src/ledger.rs:7460-7464`): the fee is charged and nothing runs,
+ * so it is refused here like the `DISABLED_VARIANTS`.
+ */
+const QUERY_CAPABILITIES_VARIANT = 30;
+
+/**
+ * Variant index -> `DISABLED_FEATURES` key for every variant this module
+ * refuses to put in a transaction: the four `DISABLED_VARIANTS` plus
+ * QueryCapabilities. The keys are the PascalCase Rust variant names.
  * 22 is refused at ingress (`src/ledger.rs:1445-1450`); 48, 49 and 52 are
  * skipped by the block dispatcher after the fee is charged
- * (`src/ledger.rs:8669-8685, 8687-8697, 8809-8828`).
+ * (`src/ledger.rs:8669-8685, 8687-8697, 8809-8828`); 30 is a no-op in blocks
+ * after the fee is charged (`src/ledger.rs:7460-7464`).
  */
 const DISABLED_VARIANT_FEATURES = Object.freeze({
   22: 'SubDelegate',
+  30: 'QueryCapabilities',
   48: 'ZkPrivateTransfer',
   49: 'ZkIdentityProof',
   52: 'PqSignedTransfer',
@@ -75,6 +91,14 @@ for (const v of DISABLED_VARIANTS) {
   const key = DISABLED_VARIANT_FEATURES[v];
   if (key === undefined || !Object.prototype.hasOwnProperty.call(DISABLED_FEATURES, key)) {
     throw new Error(`transaction.js: DISABLED_VARIANTS contains ${v} but DISABLED_VARIANT_FEATURES has no DISABLED_FEATURES key for it`);
+  }
+}
+for (const [v, key] of Object.entries(DISABLED_VARIANT_FEATURES)) {
+  if (!DISABLED_VARIANTS.includes(Number(v)) && Number(v) !== QUERY_CAPABILITIES_VARIANT) {
+    throw new Error(`transaction.js: DISABLED_VARIANT_FEATURES refuses variant ${v}, which is neither in DISABLED_VARIANTS nor QueryCapabilities`);
+  }
+  if (!Object.prototype.hasOwnProperty.call(DISABLED_FEATURES, key)) {
+    throw new Error(`transaction.js: DISABLED_VARIANT_FEATURES maps ${v} to '${key}', which is not a DISABLED_FEATURES key`);
   }
 }
 
@@ -258,25 +282,33 @@ function blockhashFromHex(hex) {
 }
 
 /**
- * Checks that encoded instruction data can pass the node's ingress gate as far
- * as the SDK can tell without state, and returns its variant index.
+ * Checks one encoded instruction on its own: variant index, refused
+ * variants and size. Returns the variant index.
  *
  * Mirrors, in this order: the data must carry a `u32le` variant index that is a
  * `XerisInstruction` (`src/network.rs:183-187` "Instruction data is not a
  * recognized type"; `src/token.rs:30-808` has 62 variants); the variant must
  * not be one the node refuses (22 at ingress, `src/ledger.rs:1445-1450`) or
  * skips after charging the fee (48/49/52, `src/ledger.rs:8669-8685, 8687-8697,
- * 8809-8828`); the data must be at most `MAX_IX_DATA_SIZE` bytes, or
- * `MAX_SLASH_IX_DATA_SIZE` for `SlashReport` (`src/network.rs:168-179`,
- * `src/ledger.rs:93, 119, 125-130` "Instruction data exceeds size limit").
- * Field-level decoding is not re-checked here; the builders in
- * `instructions/*` emit canonical bincode.
+ * 8809-8828`; 30, an empty dispatcher arm, `src/ledger.rs:7460-7464`); the
+ * data must be at most `MAX_IX_DATA_SIZE` bytes, or `MAX_SLASH_IX_DATA_SIZE`
+ * for `SlashReport` (`src/network.rs:168-179`, `src/ledger.rs:93, 119, 125-130`
+ * "Instruction data exceeds size limit"); the whole data must decode as
+ * `bincode::deserialize::<XerisInstruction>` does (`decodeInstruction`: no
+ * truncated field, `String` valid UTF-8, `Option` tag and `bool` byte 0 or 1;
+ * trailing bytes ignored), as the node's ingress requires
+ * (`src/network.rs:180-187`).
+ *
+ * Field-level rules are not checked here. `buildTransaction` (and therefore
+ * every send path of the SDK) additionally applies the node's stateless
+ * semantic gate, which needs the signer (`assertTransactionSemantics`).
  * @param {Buffer|Uint8Array} data Encoded `XerisInstruction`.
  * @param {number} [index] Position in the transaction, used only in error messages.
  * @returns {number} The variant index (`0..INSTRUCTION_COUNT-1`).
  * @throws {TypeError} When `data` is not a `Buffer`/`Uint8Array`, or `index` is not a non-negative integer.
- * @throws {EncodingError} When `data` is shorter than 4 bytes or the variant index is `>= INSTRUCTION_COUNT`.
- * @throws {FeatureDisabledError} For variants 22, 48, 49 and 52.
+ * @throws {EncodingError} When `data` is shorter than 4 bytes, the variant index is `>= INSTRUCTION_COUNT`,
+ *   or the fields do not decode.
+ * @throws {FeatureDisabledError} For variants 22, 30, 48, 49 and 52.
  * @throws {RangeError} When `data` exceeds the node's size cap for its variant.
  */
 function assertInstructionSubmittable(data, index) {
@@ -304,7 +336,395 @@ function assertInstructionSubmittable(data, index) {
       `${label}: ${data.length} bytes exceeds the node's ${cap}-byte limit for ${what}; the node rejects it with "Instruction data exceeds size limit"`,
     );
   }
+  const decoded = tryDecodeInstruction(data);
+  if (!decoded.ok) {
+    // network.rs:180-187: ingress admits only data that bincode-decodes as a
+    // XerisInstruction (or a SystemInstruction, which this SDK never builds).
+    throw new EncodingError(
+      `${label}: does not decode as a XerisInstruction (${decoded.reason}); the node rejects it with "Instruction data is not a recognized type" (network.rs:180-187)`,
+      { field: label },
+    );
+  }
   return variant;
+}
+
+// ---------------------------------------------------------------------------
+// Stateless semantic gate (ledger.rs:1382-1455)
+// ---------------------------------------------------------------------------
+
+/** Strict UTF-8 decoder: bincode decodes `String` with `str::from_utf8`, which refuses invalid UTF-8. */
+const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/** Methods whose 16-byte binary args a Swap contract accepts (`src/ledger.rs:2367-2371`). */
+const BINARY_SWAP_METHODS = Object.freeze(['swap_a_to_b', 'swap_b_to_a']);
+
+/**
+ * `validate_native_transfer_destination` (`src/ledger.rs:1569-1577`).
+ * @param {string} to
+ * @param {bigint} amount
+ * @returns {string|null} the node's error text, or `null` when accepted
+ */
+function nativeTransferProblem(to, amount) {
+  if (amount === 0n) return 'NativeTransfer amount must be positive';
+  if (!isCanonicalPubkey(to) || to.startsWith('__')) return 'NativeTransfer destination must be a canonical public key';
+  return null;
+}
+
+/**
+ * Variants whose block handler skips the instruction (after the fee is
+ * charged, `ledger.rs:5516-5546`) unless one string field equals the account
+ * the instruction runs as: the signer (`account_keys[0]`, `ledger.rs:5506`)
+ * at the top level. `field` is the Rust field name (`VARIANT_FIELDS`).
+ * Variants 1, 2, 3, 6 and 8 have no dispatcher arm of their own and reach
+ * `token::process_token_instruction` (`ledger.rs:8873-8880`), which compares
+ * the field with the signer it is given.
+ * @type {Readonly<Record<number, {field: string, cite: string}>>}
+ */
+const SIGNER_BOUND_FIELDS = Object.freeze({
+  1: { field: 'from', cite: 'token.rs:38-43, 1104; ledger.rs:8873-8880' }, // TokenTransfer
+  2: { field: 'from', cite: 'token.rs:45-49, 1151; ledger.rs:8873-8880' }, // TokenBurn
+  3: { field: 'mint_authority', cite: 'token.rs:51-58, 1036; ledger.rs:8873-8880' }, // TokenCreate
+  6: { field: 'mint_authority', cite: 'token.rs:83-89, 1225; ledger.rs:8873-8880' }, // TokenCreateRWA
+  8: { field: 'from', cite: 'token.rs:118-123, 1306; ledger.rs:8873-8880' }, // RWATransfer
+  9: { field: 'pubkey', cite: 'token.rs:132; ledger.rs:5686-5689' }, // Stake
+  10: { field: 'pubkey', cite: 'token.rs:139; ledger.rs:5737-5740' }, // Unstake
+  11: { field: 'from', cite: 'token.rs:152; ledger.rs:5593-5597' }, // NativeTransfer
+  18: { field: 'identity_pubkey', cite: 'token.rs:268; ledger.rs:6687-6693' }, // CreateIdentity
+  28: { field: 'provider_identity', cite: 'token.rs:375; ledger.rs:7389-7392' }, // RegisterCapability
+  29: { field: 'provider_identity', cite: 'token.rs:396; ledger.rs:7435-7438' }, // UpdateCapability
+  32: { field: 'claimant_identity', cite: 'token.rs:456; ledger.rs:7507-7524' }, // ClaimTask
+  34: { field: 'identity_pubkey', cite: 'token.rs:477; ledger.rs:7633-7643' }, // RegisterModel
+  45: { field: 'identity_pubkey', cite: 'token.rs:590; ledger.rs:8420-8439' }, // AgentHeartbeat
+  51: { field: 'ed25519_pubkey', cite: 'token.rs:694; ledger.rs:8738-8753' }, // PqKeyRotate
+});
+
+/**
+ * The `SIGNER_BOUND_FIELDS` variants that `token::process_token_instruction`
+ * binds. An AgentExecute inner instruction of these runs through it with the
+ * owner as signer (`ledger.rs:6522, 6648-6655`); a ConditionalOrder inner one
+ * with the order owner, who is the transaction signer (`contracts.rs:3804-3806`,
+ * `ledger.rs:7106, 9270-9272`).
+ * @type {ReadonlyArray<number>}
+ */
+const TOKEN_PROCESSOR_BOUND = Object.freeze([1, 2, 3, 6, 8]);
+
+/**
+ * Block-level signer binding: the instruction's actor field must be the
+ * transaction signer, or the block skips the instruction after charging the
+ * fee. HardwareAttest (variant 27, `token.rs:361-369`) needs the signer to be
+ * `bound_identity` when that is non-empty and `device_pubkey` otherwise
+ * (`ledger.rs:7237-7253`). Returns `null` for other variants.
+ * @param {import('./instructions/index.js').DecodedInstruction} d
+ * @param {string} signer
+ * @returns {{message: string, cite: string, inBlock: true}|null}
+ */
+function signerBindingProblem(d, signer) {
+  const f = d.fields;
+  const skipped = 'the block skips it after charging the fee';
+  if (d.variant === 27) {
+    const device = f.device_pubkey;
+    const bound = f.bound_identity;
+    const cite = 'token.rs:361-369; ledger.rs:7237-7253';
+    if (bound === '' && device !== signer) {
+      return { message: `HardwareAttest.device_pubkey ${device} is not the signer ${signer} and bound_identity is empty; ${skipped}`, cite, inBlock: true };
+    }
+    if (bound !== '' && bound !== signer) {
+      return { message: `HardwareAttest.bound_identity ${bound} is not the signer ${signer}; ${skipped}`, cite, inBlock: true };
+    }
+    return null;
+  }
+  const spec = SIGNER_BOUND_FIELDS[d.variant];
+  if (spec === undefined) return null;
+  const value = f[spec.field];
+  if (value === signer) return null;
+  return { message: `${d.name}.${spec.field} ${value} is not the signer ${signer}; ${skipped}`, cite: spec.cite, inBlock: true };
+}
+
+/**
+ * The node's ingress error for one instruction, or a payload the block would
+ * reject after the fee (signer binding, inner-instruction rules, unparseable
+ * contract JSON), or `null`. Ingress checks are reported first. Data that
+ * does not decode returns `null`; `assertInstructionSubmittable` refuses it.
+ * @param {Uint8Array} data
+ * @param {string} signer
+ * @returns {{message: string, cite: string, inBlock?: boolean}|null} `inBlock` marks a
+ *   payload the node admits but fails (or rewrites) in the block.
+ */
+function semanticProblem(data, signer) {
+  const d = decodeInstruction(data);
+  if (d === null) return null;
+  const p = statelessProblem(d, signer);
+  return p !== null ? p : signerBindingProblem(d, signer);
+}
+
+/**
+ * `validate_tx_semantics` for one decoded instruction, plus the stateless
+ * block checks on AgentExecute / ConditionalOrder inner instructions and the
+ * JSON checks on ContractCall args and ContractDeploy params; see
+ * `semanticProblem`.
+ * @param {import('./instructions/index.js').DecodedInstruction} d
+ * @param {string} signer
+ * @returns {{message: string, cite: string, inBlock?: boolean}|null}
+ */
+function statelessProblem(d, signer) {
+  const { variant } = d;
+  const f = d.fields;
+  if (variant === 12) {
+    if (f.block_hash_prefix.length !== 32) {
+      return { message: `ValidatorAttestation block_hash_prefix must be exactly 32 bytes (got ${f.block_hash_prefix.length})`, cite: 'ledger.rs:1398-1404' };
+    }
+    if (f.validator !== signer) return { message: 'ValidatorAttestation validator must equal the transaction signer', cite: 'ledger.rs:1405-1409' };
+    return null;
+  }
+  if (variant === 11) {
+    const m = nativeTransferProblem(f.to, f.amount);
+    return m === null ? null : { message: m, cite: 'ledger.rs:1417-1419, 1569-1577' };
+  }
+  if (variant === 0) {
+    return f.amount === 0n ? { message: 'TokenMint amount must be positive', cite: 'ledger.rs:1420-1422' } : null;
+  }
+  if (variant === 8) {
+    return f.amount === 0n || f.from === f.to
+      ? { message: 'RWATransfer requires positive amount and distinct accounts', cite: 'ledger.rs:1423-1427' }
+      : null;
+  }
+  if (variant === 17 || variant === 23) return wrappedProblem(d, signer);
+  if (variant === 4) {
+    // contract_call_args (ledger.rs:2367-2371): 16 raw bytes pass through only for the
+    // two Swap methods; everything else must be a JSON object serde_json accepts, or the
+    // call is rejected in the block after the fee is charged (ledger.rs:2359-2365, 5884-5891).
+    if (BINARY_SWAP_METHODS.includes(f.method) && f.args.length === 16) return null;
+    const why = jsonObjectProblem(f.args, 'args');
+    return why === null ? null : {
+      message: `ContractCall ${f.contract_id}.${f.method}: args must be a JSON object the node can parse (${why}); the block would reject the call after charging the fee`,
+      cite: 'ledger.rs:2359-2371, 5884-5891',
+      inBlock: true,
+    };
+  }
+  if (variant === 5) {
+    // ledger.rs:6187 replaces unparseable params_json with {} and deploys from defaults.
+    const why = jsonObjectProblem(Buffer.from(f.params_json, 'utf8'), 'params_json');
+    return why === null ? null : {
+      message: `ContractDeploy ${f.contract_id}: params_json must be JSON text of an object (${why}); the node would deploy from {} instead`,
+      cite: 'ledger.rs:6187',
+      inBlock: true,
+    };
+  }
+  return null;
+}
+
+/**
+ * AgentExecute (17) / ConditionalOrder (23). First the ingress rules of
+ * `validate_tx_semantics` for a decodable inner instruction
+ * (`ledger.rs:1428-1443`), then the stateless rules the block applies after
+ * charging the fee (`ledger.rs:5516-5546`):
+ * - ConditionalOrder `condition_type` in `CONDITION_TYPES` (`ledger.rs:6916-6921`);
+ * - the inner instruction decodes (`ledger.rs:6399-6405`, `6923-6927`);
+ * - ConditionalOrder inner instruction at most `MAX_CONDITIONAL_INNER_BYTES`
+ *   (`ledger.rs:6941-6944`);
+ * - AgentExecute inner variant in `AGENT_INNER_VARIANTS` (`ledger.rs:6478-6484`);
+ * - AgentExecute inner ContractCall not targeting an `agent_registry_`
+ *   contract (`ledger.rs:6428-6431`);
+ * - inner ContractCall args (see `statelessProblem`);
+ * - inner TokenTransfer/TokenBurn `from` (and, for ConditionalOrder, also
+ *   TokenCreate/TokenCreateRWA `mint_authority` and RWATransfer `from`) equal
+ *   to the account it runs as: the AgentExecute owner, or the ConditionalOrder
+ *   signer.
+ * @param {import('./instructions/index.js').DecodedInstruction} d
+ * @param {string} signer
+ * @returns {{message: string, cite: string, inBlock?: boolean}|null}
+ */
+function wrappedProblem(d, signer) {
+  const { variant } = d;
+  const f = d.fields;
+  const innerBytes = f.inner_instruction;
+  const inner = decodeInstruction(innerBytes);
+  if (inner !== null) {
+    const g = inner.fields;
+    const cite = 'ledger.rs:1428-1443';
+    switch (inner.variant) {
+      case 11: {
+        const m = nativeTransferProblem(g.to, g.amount);
+        if (m !== null) return { message: m, cite: `${cite}, 1569-1577` };
+        break;
+      }
+      case 0:
+        if (g.amount === 0n) return { message: 'nested TokenMint amount must be positive', cite };
+        break;
+      case 8:
+        if (g.amount === 0n || g.from === g.to) return { message: 'nested RWATransfer requires positive amount and distinct accounts', cite };
+        break;
+      case 17:
+      case 23:
+        return { message: 'recursive delegated/conditional instructions are not allowed', cite };
+      default:
+        break;
+    }
+  }
+  const skipped = 'the block skips it after charging the fee';
+  if (variant === 23 && !CONDITION_TYPES.includes(f.condition_type)) {
+    return {
+      message: `ConditionalOrder condition_type ${JSON.stringify(f.condition_type)} is not one of ${CONDITION_TYPES.join(', ')}; ${skipped}`,
+      cite: 'ledger.rs:6916-6921',
+      inBlock: true,
+    };
+  }
+  if (inner === null) {
+    const why = tryDecodeInstruction(innerBytes).reason;
+    return {
+      message: `${d.name} inner_instruction does not decode as a XerisInstruction (${why}); ${skipped}`,
+      cite: variant === 17 ? 'ledger.rs:6399-6405' : 'ledger.rs:6923-6927',
+      inBlock: true,
+    };
+  }
+  if (variant === 23 && innerBytes.length > MAX_CONDITIONAL_INNER_BYTES) {
+    return {
+      message: `ConditionalOrder inner_instruction is ${innerBytes.length} bytes, above the ${MAX_CONDITIONAL_INNER_BYTES}-byte cap; ${skipped}`,
+      cite: 'ledger.rs:6941-6944',
+      inBlock: true,
+    };
+  }
+  if (variant === 17 && !AGENT_INNER_VARIANTS.includes(inner.variant)) {
+    return {
+      message: `AgentExecute inner ${inner.name} (variant ${inner.variant}) is not in the delegation allow-list (${AGENT_INNER_VARIANTS.map((v) => VARIANT_NAMES[v]).join(', ')}); ${skipped}`,
+      cite: 'ledger.rs:6425-6484',
+      inBlock: true,
+    };
+  }
+  const g = inner.fields;
+  if (variant === 17 && inner.variant === 4 && g.contract_id.startsWith('agent_registry_')) {
+    return {
+      message: `nested ContractCall ${g.contract_id}.${g.method}: AgentExecute may not call an agent registry; ${skipped}`,
+      cite: 'ledger.rs:6428-6431',
+      inBlock: true,
+    };
+  }
+  if (inner.variant === 4) {
+    // AgentExecute: the inner args must parse as a JSON object, with no binary-swap
+    // exemption, or the block skips it after the fee (ledger.rs:6436-6442, 5516-5546).
+    // ConditionalOrder: the inner call goes through contract_call_args when the order
+    // fires (ledger.rs:9181), which keeps the 16-byte swap payload and otherwise
+    // parses the args with inject_consensus_slot (ledger.rs:2359-2371); a failure
+    // cancels the order.
+    if (variant === 23 && BINARY_SWAP_METHODS.includes(g.method) && g.args.length === 16) return null;
+    const why = jsonObjectProblem(g.args, 'args');
+    if (why === null) return null;
+    return variant === 17
+      ? {
+        message: `nested ContractCall ${g.contract_id}.${g.method}: AgentExecute args must be a JSON object the node can parse (${why}); the block would skip the call after charging the fee`,
+        cite: 'ledger.rs:6436-6442, 5516-5546',
+        inBlock: true,
+      }
+      : {
+        message: `nested ContractCall ${g.contract_id}.${g.method}: ConditionalOrder args must be a JSON object the node can parse (${why}); the order would be cancelled when it fires`,
+        cite: 'ledger.rs:2359-2371, 9181',
+        inBlock: true,
+      };
+  }
+  if (TOKEN_PROCESSOR_BOUND.includes(inner.variant)) {
+    const spec = SIGNER_BOUND_FIELDS[inner.variant];
+    const value = g[spec.field];
+    const tokenCite = spec.cite.split(';')[0];
+    if (variant === 17 && value !== f.owner_pubkey) {
+      return {
+        message: `nested ${inner.name}.${spec.field} ${value} is not the AgentExecute owner ${f.owner_pubkey}; the block runs it as the owner and drops it after charging the fee`,
+        cite: `ledger.rs:6522, 6648-6655; ${tokenCite}`,
+        inBlock: true,
+      };
+    }
+    if (variant === 23 && value !== signer) {
+      return {
+        message: `nested ${inner.name}.${spec.field} ${value} is not the ConditionalOrder signer ${signer}; the order runs it as its owner (the signer) when it fires, the token processor refuses it and the order is cancelled`,
+        cite: `contracts.rs:3804-3806; ledger.rs:9270-9272; ${tokenCite}`,
+        inBlock: true,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Why `bytes` would not reach a contract as the JSON object it looks like, or
+ * `null` when the node's serde_json reads it unchanged (`parseJson` with
+ * `forNode`: UTF-8, well-formed, an object, no lone surrogate, numbers in
+ * range, nesting at most 127).
+ * @param {Uint8Array} bytes
+ * @param {string} label field name for the reason text
+ * @returns {string|null}
+ */
+function jsonObjectProblem(bytes, label) {
+  let text;
+  try {
+    text = UTF8.decode(bytes);
+  } catch (_) {
+    return `${label}: not valid UTF-8`;
+  }
+  let value;
+  try {
+    value = parseJson(text, label, { forNode: true });
+  } catch (err) {
+    if (err instanceof SyntaxError || err instanceof RangeError || err instanceof TypeError) return err.message;
+    throw err;
+  }
+  return isPlainJsonObject(value) ? null : `${label}: not a JSON object`;
+}
+
+/**
+ * Applies the node's stateless semantic gate to the instructions of a
+ * transaction signed by `signer`, before anything is signed. Mirrors
+ * `validate_tx_semantics` (`src/ledger.rs:1382-1455`, called for every ingress
+ * path at `src/network.rs:208`):
+ * - NativeTransfer: `amount > 0`, `to` a canonical public key not starting
+ *   with `__` (`ledger.rs:1417-1419, 1569-1577`);
+ * - TokenMint: `amount > 0`; RWATransfer: `amount > 0` and `from != to`;
+ * - ValidatorAttestation: hash exactly 32 bytes and `validator == signer`;
+ * - AgentExecute / ConditionalOrder: the same rules for a decodable inner
+ *   NativeTransfer, TokenMint or RWATransfer, and no nested AgentExecute /
+ *   ConditionalOrder.
+ * It also refuses payloads the node accepts at ingress but rejects in the
+ * block after charging the fee (`ledger.rs:5516-5546`):
+ * - ContractCall args that are not a JSON object serde_json can parse (except
+ *   the 16-byte swap payload; `ledger.rs:2359-2371`), at the top level and as
+ *   the inner instruction of AgentExecute (no swap exception there,
+ *   `ledger.rs:6436-6442`) or ConditionalOrder (`ledger.rs:9181`);
+ * - ContractDeploy `params_json` that is not JSON text of an object (the
+ *   node substitutes `{}`, `ledger.rs:6187`);
+ * - an AgentExecute / ConditionalOrder inner instruction that does not decode
+ *   (`ledger.rs:6399-6405, 6923-6927`), an AgentExecute inner variant outside
+ *   `AGENT_INNER_VARIANTS` (`ledger.rs:6478-6484`), a ConditionalOrder
+ *   `condition_type` outside `CONDITION_TYPES` (`ledger.rs:6916-6921`) or an
+ *   inner instruction above `MAX_CONDITIONAL_INNER_BYTES` (`ledger.rs:6941-6944`),
+ *   or an AgentExecute inner ContractCall to an `agent_registry_` contract
+ *   (`ledger.rs:6428-6431`);
+ * - an actor field that is not the signer: TokenTransfer / TokenBurn /
+ *   RWATransfer / NativeTransfer `from`, TokenCreate / TokenCreateRWA
+ *   `mint_authority`, Stake/Unstake `pubkey`, CreateIdentity / RegisterModel /
+ *   AgentHeartbeat `identity_pubkey`, Register/UpdateCapability
+ *   `provider_identity`, ClaimTask `claimant_identity`, PqKeyRotate
+ *   `ed25519_pubkey`, and for HardwareAttest `bound_identity` when set, else
+ *   `device_pubkey` (see `SIGNER_BOUND_FIELDS` for the lines);
+ * - an AgentExecute inner TokenTransfer / TokenBurn whose `from` is not the
+ *   owner (`ledger.rs:6522, 6648-6655`), and a ConditionalOrder inner
+ *   TokenTransfer / TokenBurn / RWATransfer / TokenCreate / TokenCreateRWA
+ *   whose `from` / `mint_authority` is not the signer (the order is cancelled
+ *   when it fires, `ledger.rs:9270-9272`).
+ * Data that does not decode is refused by `assertInstructionSubmittable`
+ * before this runs; here it is skipped.
+ * @param {string} signer Base58 fee payer (`account_keys[0]`).
+ * @param {Array<Uint8Array>} list Encoded instructions.
+ * @returns {void}
+ * @throws {RangeError} `instructions[i]: the node rejects this at ingress with "<node message>" (<citation>)`,
+ *   or `instructions[i]: <reason> (<citation>)` for a payload the block would reject or rewrite.
+ */
+function assertTransactionSemantics(signer, list) {
+  for (let i = 0; i < list.length; i += 1) {
+    const p = semanticProblem(list[i], signer);
+    if (p !== null) {
+      throw new RangeError(p.inBlock
+        ? `instructions[${i}]: ${p.message} (${p.cite})`
+        : `instructions[${i}]: the node rejects this at ingress with "${p.message}" (${p.cite})`);
+    }
+  }
 }
 
 /**
@@ -331,11 +751,14 @@ function blockhashBytes(value) {
  * failing instruction does not roll back earlier ones (`src/ledger.rs:5557-5570`).
  * @param {string} payerPubkey Canonical base58 public key of the signer and fee payer.
  * @param {Buffer|Uint8Array|Array<Buffer|Uint8Array>} instructions One encoded
- *   instruction or an array of 1..16; each is checked with `assertInstructionSubmittable`.
+ *   instruction or an array of 1..16; each is checked with `assertInstructionSubmittable`,
+ *   then all of them with the node's stateless semantic gate for this payer
+ *   (`validate_tx_semantics`, `src/ledger.rs:1382-1455`; see `assertTransactionSemantics`).
  * @param {Buffer|Uint8Array} recentBlockhash 32 raw bytes (from `blockhashFromHex`).
  * @returns {Transaction} Unsigned; `feePayer` and `recentBlockhash` set.
  * @throws {TypeError} Wrong types.
- * @throws {RangeError} Non-canonical payer, 0 or more than 16 instructions, blockhash not 32 bytes, oversize instruction.
+ * @throws {RangeError} Non-canonical payer, 0 or more than 16 instructions, blockhash not 32 bytes, oversize
+ *   instruction, or an instruction the node's semantic gate rejects (message quotes the node's error).
  * @throws {EncodingError|FeatureDisabledError} From `assertInstructionSubmittable`.
  */
 function buildTransaction(payerPubkey, instructions, recentBlockhash) {
@@ -354,10 +777,11 @@ function buildTransaction(payerPubkey, instructions, recentBlockhash) {
     throw new RangeError(`instructions: ${list.length} instructions exceeds MAX_IX_PER_TX = ${MAX_IX_PER_TX} (ledger.rs:94; network.rs:162-164)`);
   }
   const blockhash = blockhashBytes(recentBlockhash);
+  for (let i = 0; i < list.length; i += 1) assertInstructionSubmittable(list[i], i);
+  assertTransactionSemantics(payerPubkey, list);
   const payer = new PublicKey(payerPubkey);
   const tx = new Transaction();
   for (let i = 0; i < list.length; i += 1) {
-    assertInstructionSubmittable(list[i], i);
     tx.add(new TransactionInstruction({
       keys: [{ pubkey: payer, isSigner: true, isWritable: true }],
       programId: PROGRAM_ID,

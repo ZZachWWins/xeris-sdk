@@ -27,6 +27,7 @@
  * positional argument would shift every later field on the wire.
  */
 
+const { Buffer } = require('buffer');
 const {
   assertString,
   concat,
@@ -38,6 +39,8 @@ const {
   encodeU64,
   encodeU8,
   encodeVariant,
+  assertJsonObjectText,
+  stringifyJson,
   toBytes,
 } = require('../encoding');
 const { EncodingError } = require('../errors');
@@ -119,17 +122,23 @@ function isPlainObject(value) {
  * object for every method (the dispatcher inserts `current_slot` into it and
  * refuses non-object JSON and non-UTF-8 with "contract args must be a JSON
  * object"), or, for a Swap contract's `swap_a_to_b`/`swap_b_to_a` only, exactly
- * 16 raw bytes. This function therefore accepts:
+ * 16 raw bytes. A JSON payload the node cannot parse fails in the block, after
+ * the fee is charged. This function therefore accepts:
  *
  * - `Buffer | Uint8Array`: used verbatim (a copy is taken). This is the only way
  *   to send the 16-byte swap payload; see `encodeSwapCall`.
- * - a plain object: `JSON.stringify(args)` as UTF-8. `bigint` values are not
- *   JSON-serialisable and raise `TypeError`; callers convert them to a safe
- *   `number` first (the node parses JSON numbers with `as_u64`).
+ * - a plain object: written with `stringifyJson` as UTF-8. `bigint` values in
+ *   `0..2^64-1` are written as exact integers (the node reads them with
+ *   `as_u64`, e.g. `contracts.rs:2847-2850, 2944-2947`); an integer `number`
+ *   above 2^53-1, `NaN`/`Infinity`, `undefined`, functions, non-plain objects
+ *   and lone surrogates throw instead of being rewritten the way
+ *   `JSON.stringify` would (a dropped or `null` `min_tokens_out` is read as 0
+ *   by the node, `contracts.rs:2849-2850`).
  * - a string: taken as already-serialised JSON text and sent byte-for-byte. It
- *   must parse as a JSON object, because the node refuses every other JSON
- *   value (`ledger.rs:2362`); this catches a hex string or a bare number passed
- *   by mistake before it is signed.
+ *   must be JSON text of an object that serde_json reads unchanged
+ *   (`assertJsonObjectText` in `src/encoding.js`); this catches a hex string,
+ *   a bare number, a `\ud800` escape or a `1e400` passed by mistake before it
+ *   is signed.
  *
  * Anything else (array, number, boolean, `null`, `undefined`) is rejected: 4.x
  * JSON-encoded whatever it received, which put `{"type":"Buffer",...}` on the
@@ -138,42 +147,19 @@ function isPlainObject(value) {
  * @param {Buffer|Uint8Array|object|string} args
  * @returns {Buffer} the raw `Vec<u8>` payload (without its length prefix)
  * @throws {TypeError} unsupported type, non-JSON string or unserialisable object
- * @throws {RangeError} string containing a lone UTF-16 surrogate
+ * @throws {RangeError} lone UTF-16 surrogate, non-finite number, integer `number` above 2^53-1,
+ *   `bigint` outside `-2^63..2^64-1`, nesting deeper than 127
  */
 function contractCallArgsBytes(args) {
   if (isByteArray(args)) {
     return toBytes(args, 'args');
   }
   if (isPlainObject(args)) {
-    let json;
-    try {
-      json = JSON.stringify(args);
-    } catch (err) {
-      throw new TypeError(`contractCall: args object is not JSON-serialisable (${err.message})`);
-    }
-    if (typeof json !== 'string') {
-      // Only reachable through a `toJSON` that returns undefined.
-      throw new TypeError('contractCall: args object produced no JSON value');
-    }
-    return Buffer.from(json, 'utf8');
+    return Buffer.from(stringifyJson(args, 'args'), 'utf8');
   }
   if (typeof args === 'string') {
     assertString(args, 'args');
-    let parsed;
-    try {
-      parsed = JSON.parse(args);
-    } catch (err) {
-      throw new TypeError(
-        `contractCall: args string must be JSON text of an object (${err.message}); `
-        + 'pass a Buffer/Uint8Array for raw bytes',
-      );
-    }
-    if (!isPlainObject(parsed)) {
-      throw new TypeError(
-        'contractCall: args string must be JSON text of an object; the node refuses '
-        + 'any other JSON value (ledger.rs:2359-2363)',
-      );
-    }
+    assertJsonObjectText(args, 'contractCall: args', 'ledger.rs:2359-2363', 'pass a Buffer/Uint8Array for raw bytes');
     return Buffer.from(args, 'utf8');
   }
   throw new TypeError(
@@ -332,7 +318,15 @@ function contractCall(contractId, method, args) {
  * `paramsJson`.
  *
  * `paramsJson` is the JSON text itself (`params_json: String`); callers holding
- * an object pass `JSON.stringify(params)`.
+ * an object pass `stringifyJson(params)`. The node parses it with
+ * `serde_json::from_str(params_json).unwrap_or(json!({}))` (`ledger.rs:6187`):
+ * text it cannot parse is silently replaced by `{}`, and the contract is then
+ * built from defaults or fails in the block after the fee is charged. Like
+ * every builder here this one only encodes (any well-formed string is a valid
+ * `String` field), but the transaction layer refuses to sign a ContractDeploy
+ * whose `params_json` is not JSON text of an object that serde_json reads
+ * unchanged (`buildTransaction` → `assertTransactionSemantics` in
+ * `src/transaction.js`), so it never reaches the node through the SDK.
  *
  * Node rules, not enforced here: `contractId` must not exist (`ledger.rs:6162`)
  * and must not use a reserved namespace (prefixes `xeris_`, `identity_`,
@@ -340,11 +334,11 @@ function contractCall(contractId, method, args) {
  * `contractTypeStr` is matched case-insensitively against the aliases in
  * `ContractType::from_str` (`contracts.rs:385-411`), an unknown type is skipped
  * (`ledger.rs:6237`); protocol-managed registry types cannot be user-deployed
- * (`ledger.rs:2344-2349, 6182`); invalid `paramsJson` is parsed as `{}`
- * (`ledger.rs:6187`). The signer becomes the contract owner (`ledger.rs:6189`).
+ * (`ledger.rs:2344-2349, 6182`). The signer becomes the contract owner
+ * (`ledger.rs:6189`).
  * @param {string} contractId contract identifier
  * @param {string} contractTypeStr contract type alias, e.g. `'swap'`, `'launchpad'`
- * @param {string} paramsJson constructor parameters as JSON text
+ * @param {string} paramsJson constructor parameters as JSON text of an object
  * @returns {Buffer} encoded instruction
  * @throws {EncodingError} wrong argument count (`code: 'arity'`)
  * @throws {TypeError|RangeError} a field has the wrong type or contains a lone surrogate

@@ -6,7 +6,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Transaction } = require('@solana/web3.js');
 
-const { XerisDApp, Instructions, XerisError, FeatureDisabledError, TESTNET_SEED, DEFAULT_RPC_PORT } = require('..');
+const {
+  XerisDApp, Instructions, XerisError, FeatureDisabledError, TESTNET_SEED, DEFAULT_RPC_PORT,
+  assembleSignedTransaction, blockhashFromHex, signatureOf,
+} = require('..');
 const H = require('./_helpers');
 
 const BOB = '11111111111111111111111111111112';
@@ -38,10 +41,23 @@ test('signTransaction returning a signed web3 Transaction: the SDK submits the v
   const dapp = new XerisDApp({ provider: provider(signedWeb3), fetch });
   assert.deepEqual(await dapp.connect(), { publicKey: H.GOLDEN_PUBKEY });
   assert.equal(dapp.client.rpcUrl, `http://${TESTNET_SEED}:${DEFAULT_RPC_PORT}`);
-  const res = await dapp.sendInstruction(Buffer.from(H.GOLDEN_IX_HEX, 'hex'));
+  const ix = Instructions.nativeTransfer(H.GOLDEN_PUBKEY, H.OTHER_PUBKEY, 5_000_000_000);
+  const res = await dapp.sendInstruction(ix);
   assert.equal(res.status, 'ok');
   const post = fetch.calls.find((c) => c.url.endsWith('/submit'));
-  assert.equal(Buffer.from(post.body.tx_base64, 'base64').toString('hex'), H.GOLDEN_TX_HEX);
+  const expected = assembleSignedTransaction(H.goldenKeypair(), ix, blockhashFromHex(H.GOLDEN_BLOCKHASH_HEX));
+  assert.equal(Buffer.from(post.body.tx_base64, 'base64').toString('hex'), expected.txBytes.toString('hex'));
+});
+
+test('sendInstruction refuses what the node semantic gate rejects before asking the wallet', async () => {
+  const fetch = fetchMock();
+  let asked = 0;
+  const dapp = new XerisDApp({ provider: provider((tx, kp) => { asked += 1; return signedWeb3(tx, kp); }), fetch });
+  await dapp.connect();
+  // The golden instruction pays 'Bob', not a canonical key (ledger.rs:1417-1419, 1569-1577).
+  await assert.rejects(dapp.sendInstruction(Buffer.from(H.GOLDEN_IX_HEX, 'hex')), RangeError);
+  assert.equal(asked, 0);
+  assert.equal(fetch.calls.filter((c) => c.url.endsWith('/submit')).length, 0);
 });
 
 test('signTransaction returning {signature} gives the same bytes', async () => {
@@ -115,4 +131,86 @@ test('airdrop and sendZkPrivateTransfer throw FeatureDisabledError synchronously
   const dapp = new XerisDApp({ provider: provider(detached), fetch: fetchMock() });
   assert.throws(() => dapp.airdrop('x', 1), FeatureDisabledError);
   assert.throws(() => dapp.sendZkPrivateTransfer(), FeatureDisabledError);
+});
+
+// ---------------------------------------------------------------------------
+// Node URL resolution, provider detection, uncertain submissions (review fixes)
+// ---------------------------------------------------------------------------
+
+test('getRpcUrl(): only a bare host:56001 derives the explorer; any other URL is kept and needs an explorer URL', async () => {
+  const withUrl = (url, extra = {}) => provider(detached, { getRpcUrl: async () => url, ...extra });
+  const noPort = new XerisDApp({ provider: withUrl('https://rpc.example.com'), fetch: fetchMock() });
+  await assert.rejects(noPort.connect(), (e) => e instanceof XerisError && e.code === 'config' && /explorer/.test(e.message));
+  const gw = new XerisDApp({ provider: withUrl('https://gw.example.com/xeris-rpc/'), fetch: fetchMock(), explorerUrl: 'https://gw.example.com/xeris-explorer' });
+  await gw.connect();
+  assert.equal(gw.client.rpcUrl, 'https://gw.example.com/xeris-rpc');
+  assert.equal(gw.client.explorerUrl, 'https://gw.example.com/xeris-explorer');
+  const fromProvider = new XerisDApp({
+    provider: withUrl('https://rpc.example.com', { getExplorerUrl: async () => 'https://explorer.example.com' }),
+    fetch: fetchMock(),
+  });
+  await fromProvider.connect();
+  assert.equal(fromProvider.client.rpcUrl, 'https://rpc.example.com');
+  assert.equal(fromProvider.client.explorerUrl, 'https://explorer.example.com');
+  const otherPort = new XerisDApp({ provider: withUrl('http://10.0.0.5:8899'), fetch: fetchMock() });
+  await assert.rejects(otherPort.connect(), (e) => e instanceof XerisError && e.code === 'config');
+  const bare = new XerisDApp({ provider: withUrl('https://10.0.0.5:56001/'), fetch: fetchMock() });
+  await bare.connect();
+  assert.equal(bare.client.rpcUrl, 'https://10.0.0.5:56001');
+  assert.equal(bare.client.explorerUrl, 'https://10.0.0.5:50008');
+});
+
+test('opts.rpcUrl alone derives the explorer only from a bare host:56001', async () => {
+  const d = new XerisDApp({ rpcUrl: 'http://10.0.0.5:56001', fetch: fetchMock() });
+  assert.equal(d.client.explorerUrl, 'http://10.0.0.5:50008');
+  const gw = new XerisDApp({ provider: provider(detached), rpcUrl: 'https://gw.example.com/rpc', fetch: fetchMock() });
+  assert.equal(gw.client, null);
+  await assert.rejects(gw.connect(), (e) => e instanceof XerisError && e.code === 'config');
+  const gw2 = new XerisDApp({
+    provider: provider(detached, { getExplorerUrl: async () => 'https://gw.example.com/explorer' }),
+    rpcUrl: 'https://gw.example.com/rpc',
+    network: 'mainnet',
+    fetch: fetchMock(),
+  });
+  await gw2.connect();
+  assert.equal(gw2.client.rpcUrl, 'https://gw.example.com/rpc');
+  assert.equal(gw2.client.explorerUrl, 'https://gw.example.com/explorer');
+});
+
+test('detectProvider ignores a window.solana that does not set isXeris', () => {
+  const saved = globalThis.window;
+  try {
+    globalThis.window = { solana: { connect: async () => 'x' } };
+    assert.equal(XerisDApp.detectProvider(), null);
+    globalThis.window = { solana: { isXeris: true, connect: async () => 'x' } };
+    assert.equal(XerisDApp.detectProvider(), globalThis.window.solana);
+    globalThis.window = { xeris: { connect: async () => 'x' }, solana: {} };
+    assert.equal(XerisDApp.detectProvider(), globalThis.window.xeris);
+  } finally {
+    if (saved === undefined) delete globalThis.window;
+    else globalThis.window = saved;
+  }
+});
+
+test('a lost /submit reply after the wallet signed carries signature and txBase64', async () => {
+  const hang = (url, init) => (url.endsWith('/submit')
+    ? Promise.reject(new Error('socket hang up'))
+    : fetchMock()(url, init));
+  const dapp = new XerisDApp({ provider: provider(detached), fetch: hang });
+  await dapp.connect();
+  const err = await dapp.transferLamports(BOB, 5).catch((e) => e);
+  assert.equal(err.code, 'rpc_transport');
+  assert.equal(typeof err.signature, 'string');
+  assert.equal(err.signature, signatureOf(Buffer.from(err.txBase64, 'base64')));
+});
+
+test('contract JSON args from the dApp carry bigint exactly and refuse undefined', async () => {
+  const fetch = fetchMock();
+  const dapp = new XerisDApp({ provider: provider(detached), fetch });
+  await dapp.connect();
+  await dapp.buyOnLaunchpad('lp', 50_000_000_000n, 15488583466903808n);
+  const post = fetch.calls.filter((c) => c.url.endsWith('/submit')).at(-1);
+  const data = Buffer.from(Transaction.from(Buffer.from(post.body.tx_base64, 'base64')).instructions[0].data);
+  assert.ok(data.toString('utf8').endsWith('{"xrs_amount":50000000000,"min_tokens_out":15488583466903808}'));
+  await assert.rejects(dapp.callContract('lp', 'buy_tokens', { xrs_amount: 1, min_tokens_out: undefined }), TypeError);
 });

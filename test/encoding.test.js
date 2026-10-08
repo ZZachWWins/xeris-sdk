@@ -429,6 +429,7 @@ test('encoding.js exports exactly the names in the cross-module contract', () =>
     'encodeFixedBytes', 'encodeStringVec', 'encodeOption', 'encodeVariant', 'readVariant',
     'concat', 'xrsToLamports', 'lamportsToXrs', 'toBaseUnits', 'fromBaseUnits',
     'encodeBincodeString', 'encodeBincodeVec', 'encodeBincodeStringVec',
+    'stringifyJson', 'parseJson', 'isPlainJsonObject', 'assertJsonObjectText',
   ];
   for (const name of expected) {
     assert.equal(typeof enc[name], 'function', `encoding.${name} should be a function`);
@@ -599,6 +600,8 @@ test('constants: contract-level amounts, windows and limits', () => {
   assert.equal(C.ACCOUNT_HISTORY_MAX_PAGE_SIZE, 200);           // tx_store.rs:57
   assert.equal(C.ACCOUNT_HISTORY_MAX_PAGE, 50);                 // explorer.rs:1305
   assert.equal(C.LIST_MAX_PAGE_SIZE, 100);                      // explorer.rs:1020
+  assert.equal(C.SIGNATURES_MAX_LIMIT, 200);                    // tx_store.rs:57, 351
+  assert.equal(C.PRICE_HISTORY_MAX_LIMIT, 10080);               // network.rs:6033
   assert.deepEqual({ ...C.STRING_LIMITS }, {
     identityDisplayName: 128, identityMetadata: 4096, reputationEvidence: 512, messagePayload: 8192,
     oracleDescription: 512, oracleMetadata: 1024, taskTitle: 256, taskDescription: 4096,
@@ -613,4 +616,109 @@ test('constants: every object and array export is frozen', () => {
     }
   }
   assert.throws(() => { C.AGENT_OPERATIONS.push('x'); }, TypeError);
+});
+
+// ---------------------------------------------------------------------------
+// Exact XRS numbers and the strict JSON writer / lossless reader (review fixes)
+// ---------------------------------------------------------------------------
+
+test('xrsToLamports / toBaseUnits refuse numbers that are not the decimal the caller wrote', () => {
+  const digits = /more than 15 significant digits/;
+  assert.throws(() => enc.xrsToLamports(9999999.999999999), (e) => e instanceof RangeError && digits.test(e.message));
+  assert.throws(() => enc.xrsToLamports(12345678.123456789), RangeError);
+  assert.throws(() => enc.toBaseUnits(1.123456789123456789, 18), RangeError);
+  assert.throws(() => enc.toBaseUnits(123456789012345678, 0), (e) => e instanceof RangeError && /2\^53-1/.test(e.message));
+  assert.equal(enc.xrsToLamports('9999999.999999999'), 9999999999999999n);
+  assert.equal(enc.xrsToLamports(0.29), 290000000n);
+  assert.equal(enc.xrsToLamports(123456.789012345), 123456789012345n);
+  assert.equal(enc.toBaseUnits(9007199254740991, 0), 9007199254740991n);
+  assert.equal(enc.toBaseUnits(1e15, 0), 1000000000000000n);
+  assert.equal(enc.toBaseUnits(0.000001234, 9), 1234n);
+});
+
+test('stringifyJson equals JSON.stringify for plain values and writes bigint exactly', () => {
+  for (const v of [null, true, 0, -0, 1.5, 1e-7, 'é💰"\\\n', [], {}, [1, 'a', [null]], { a: { b: [1, 2] }, c: 'x' }]) {
+    assert.equal(enc.stringifyJson(v), JSON.stringify(v));
+  }
+  assert.equal(enc.stringifyJson({ a: 18446744073709551615n, b: -9223372036854775808n, c: 5n }), '{"a":18446744073709551615,"b":-9223372036854775808,"c":5}');
+  assert.equal(enc.stringifyJson(Object.assign(Object.create(null), { k: 1 })), '{"k":1}');
+});
+
+test('stringifyJson refuses what JSON.stringify would drop, null or round', () => {
+  const cyc = {};
+  cyc.self = cyc;
+  let deep = 0;
+  for (let i = 0; i < 128; i += 1) deep = [deep];
+  class Box { constructor() { this.a = 1; } }
+  for (const [v, E, field] of [
+    [{ a: NaN }, RangeError, 'args.a'],
+    [{ a: -Infinity }, RangeError, 'args.a'],
+    [{ a: undefined }, TypeError, 'args.a'],
+    [{ a: [1, undefined] }, TypeError, 'args.a[1]'],
+    [{ a: () => 1 }, TypeError, 'args.a'],
+    [{ a: Symbol('s') }, TypeError, 'args.a'],
+    [{ a: 9007199254740992 }, RangeError, 'args.a'],
+    [{ a: 1e21 }, RangeError, 'args.a'],
+    [{ a: 18446744073709551616n }, RangeError, 'args.a'],
+    [{ a: -9223372036854775809n }, RangeError, 'args.a'],
+    [{ a: 'x\uD800' }, RangeError, 'args.a'],
+    [{ a: Buffer.from('ab') }, TypeError, 'args.a'],
+    [{ a: new Date(0) }, TypeError, 'args.a'],
+    [{ a: new Map() }, TypeError, 'args.a'],
+    [new Box(), TypeError, 'args'],
+    [[, 1], TypeError, 'args[0]'], // eslint-disable-line no-sparse-arrays
+    [{ [Symbol('k')]: 1 }, TypeError, 'args'],
+    [cyc, TypeError, 'args.self'],
+    [deep, RangeError, undefined],
+  ]) {
+    assert.throws(() => enc.stringifyJson(v, 'args'), (e) => e instanceof E && (field === undefined || e.field === field), `${field}`);
+  }
+  assert.throws(() => enc.stringifyJson({ '\uDC00': 1 }, 'args'), RangeError);
+});
+
+test('parseJson matches JSON.parse except for big integers, out-of-range floats and lone surrogates', () => {
+  for (const t of ['null', ' true ', '0', '-0', '1.5e3', '"a\\u00e9\\ud83d\\udcb0\\n\\/"', '[1,[2,{"a":null}]]', '{"a":1,"a":2}', '{"__proto__":{"x":1}}']) {
+    assert.deepEqual(enc.parseJson(t), JSON.parse(t), t);
+  }
+  assert.equal(Object.getPrototypeOf(enc.parseJson('{"__proto__":{"x":1}}')), Object.prototype);
+  assert.deepEqual(enc.parseJson('{"b":123456789012345678,"s":9007199254740991,"n":-9007199254740992}'), { b: 123456789012345678n, s: 9007199254740991, n: -9007199254740992n });
+  assert.equal(enc.parseJson('184467440737095516150'), 184467440737095516150n);
+  for (const bad of ['', '{', '[1,]', '{"a":1,}', '01', '1.', '.5', '+1', '"\\x"', 'NaN', '"\t"', '{} x', "'a'", '﻿{}']) {
+    assert.throws(() => enc.parseJson(bad), (e) => e instanceof SyntaxError && e.code === 'syntax', JSON.stringify(bad));
+  }
+  for (const bad of ['"\\ud800"', '{"\\udc00":1}', '"\\ud800\\u0041"', '1e400', '-1e400']) {
+    assert.throws(() => enc.parseJson(bad), RangeError, bad);
+  }
+  // forNode: the node's serde_json reading rules.
+  assert.throws(() => enc.parseJson('{"a":18446744073709551616}', 'args', { forNode: true }), RangeError);
+  assert.throws(() => enc.parseJson('{"a":-9223372036854775809}', 'args', { forNode: true }), RangeError);
+  assert.equal(enc.parseJson('18446744073709551615', 'args', { forNode: true }), 18446744073709551615n);
+  assert.throws(() => enc.parseJson(`${'['.repeat(128)}${']'.repeat(128)}`, 'args', { forNode: true }), RangeError);
+  assert.doesNotThrow(() => enc.parseJson(`${'['.repeat(127)}${']'.repeat(127)}`, 'args', { forNode: true }));
+  assert.doesNotThrow(() => enc.parseJson(`${'['.repeat(500)}${']'.repeat(500)}`));
+});
+
+test('stringifyJson and parseJson round-trip random values like the native JSON functions', () => {
+  let seed = 7;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const strs = ['', 'a', 'é', '💰', '"', '\\', '\n', '\u0001', '/', ' ', 'x'.repeat(40)];
+  const val = (d) => {
+    const r = rnd(d > 3 ? 5 : 7);
+    if (r === 0) return null;
+    if (r === 1) return rnd(2) === 0;
+    if (r === 2) return [0, 1, -1, 1.5, 1e-7, 123456789012345, -9007199254740991, 0.1, 3.14e10][rnd(9)];
+    if (r === 3) return strs[rnd(strs.length)];
+    if (r === 4) return rnd(100000);
+    if (r === 5) return Array.from({ length: rnd(4) }, () => val(d + 1));
+    const o = {};
+    for (let i = rnd(4); i > 0; i -= 1) o[strs[rnd(strs.length)] + i] = val(d + 1);
+    return o;
+  };
+  for (let i = 0; i < 2000; i += 1) {
+    const v = val(0);
+    const text = JSON.stringify(v);
+    assert.equal(enc.stringifyJson(v), text);
+    assert.deepEqual(enc.parseJson(text), JSON.parse(text));
+    assert.deepEqual(enc.parseJson(JSON.stringify(v, null, 2)), JSON.parse(text));
+  }
 });

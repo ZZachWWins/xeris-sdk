@@ -6,14 +6,23 @@
  * Mapping used across the SDK (blueprint §2):
  * - `TypeError`            wrong JavaScript type for a field (thrown as native TypeError)
  * - `RangeError`           right type, value outside the field's domain (native RangeError)
- * - `EncodingError`        structural failure: arity, unknown variant, oversize instruction, malformed hex
+ * - `EncodingError`        structural failure: arity, unknown variant, malformed hex, unreadable bytes
+ *                          (an oversize instruction is a `RangeError`)
  * - `FeatureDisabledError` anything the node refuses or skips
  * - `RpcError`             anything the node or the transport returned as a failure
  * - `XerisError`           everything else (misconfiguration, timeouts, unsupported provider)
  *
  * Every instance carries a `.code` string. Codes used by the SDK:
  * `xeris`, `encoding`, `arity`, `feature_disabled`, `rpc`, `rpc_http`,
- * `rpc_transport`, `rpc_json`, `timeout`, `config`, `provider`.
+ * `rpc_transport`, `rpc_json`, `duplicate`, `timeout`, `config`, `provider`.
+ *
+ * A failure after a signed transaction was handed to the node (codes
+ * `timeout`, `rpc_transport`, `rpc_http`, `rpc_json`, `duplicate`) carries
+ * `.signature` (base58 transaction id) and `.txBase64` (the exact bytes sent),
+ * because the node may have admitted the transaction even though no answer
+ * arrived. Recover with `waitForConfirmation(err.signature)` or resend
+ * `err.txBase64` with `submitSignedTransaction`; never re-sign, which creates
+ * a second transaction with a new signature.
  *
  * @module xeris-sdk/errors
  */
@@ -45,7 +54,8 @@ class XerisError extends Error {
 
 /**
  * Structural encoding failure: wrong argument count, unknown variant index,
- * oversize instruction data, malformed hex, unreadable instruction bytes.
+ * malformed hex, unreadable instruction bytes. (Oversize instruction data is
+ * a native `RangeError`.)
  */
 class EncodingError extends XerisError {
   /**
@@ -143,6 +153,13 @@ const DISABLED_FEATURES = Object.freeze({
     message: 'SubDelegate (variant 22) is rejected by the node at ingress with "SubDelegate is disabled (XWC-82)" and skipped in blocks. Register each agent directly with RegisterAgent (variant 15).',
     replacement: 'Instructions.registerAgent / XerisClient.registerAgent',
     citation: 'ledger.rs:1445-1450, 6911-6914',
+  }),
+  // Variant 30: the dispatcher arm is empty ("If it appears in a block, just skip it",
+  // ledger.rs:7460-7464); the fee is taken first (ledger.rs:5516-5546) and the outcome stays failed.
+  QueryCapabilities: Object.freeze({
+    message: 'QueryCapabilities (variant 30) does nothing in a block: the fee is charged, no state is read or written and nothing is returned. Search listings with GET /capabilities/search instead.',
+    replacement: 'XerisClient.searchCapabilities',
+    citation: 'ledger.rs:7460-7464',
   }),
   // Variant 48: dispatcher `continue` after the fee is charged (ledger.rs:8669-8685, NEW-CRIT-3).
   ZkPrivateTransfer: Object.freeze({

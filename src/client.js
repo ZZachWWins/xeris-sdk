@@ -33,6 +33,7 @@
  * @module xeris-sdk/client
  */
 
+const { Buffer } = require('buffer');
 const { XerisKeypair, isCanonicalPubkey } = require('./keypair');
 const {
   blockhashFromHex,
@@ -40,6 +41,7 @@ const {
   assembleSignedTransaction,
   submitBody,
   parseSubmitResponse,
+  signatureOf,
 } = require('./transaction');
 const {
   Instructions,
@@ -48,6 +50,7 @@ const {
   encodeSwapCall,
   dealTermsHash,
   buildPqRotationMessage,
+  tryDecodeInstruction,
 } = require('./instructions/index');
 const {
   normalizeU64,
@@ -56,6 +59,8 @@ const {
   toBytes,
   readVariant,
   xrsToLamports,
+  stringifyJson,
+  parseJson,
 } = require('./encoding');
 const { XerisError, EncodingError, RpcError, disabledFeature } = require('./errors');
 const {
@@ -103,6 +108,12 @@ const {
   MIN_VOTING_PERIOD_SLOTS,
   MAX_VOTING_PERIOD_SLOTS,
   STRING_LIMITS,
+  REGISTRY_PAGE_ITEMS,
+  ACCOUNT_HISTORY_MAX_PAGE,
+  ACCOUNT_HISTORY_MAX_PAGE_SIZE,
+  LIST_MAX_PAGE_SIZE,
+  SIGNATURES_MAX_LIMIT,
+  PRICE_HISTORY_MAX_LIMIT,
 } = require('./constants');
 
 // ---------------------------------------------------------------------------
@@ -130,8 +141,24 @@ const RATE_LIMIT_MESSAGE = 'Rate limited. Max 30 write RPCs per minute per IP.';
 /** Exact text of the explorer's miss for `GET /v2/tx/{sig}` (`explorer.rs:1244-1247`). */
 const TX_NOT_FOUND_MESSAGE = 'Transaction not found';
 
+/**
+ * The write routes' replies for a transaction whose first signature the node
+ * already holds: in `processed_signatures` (`network.rs:4390, 4510, 4622,
+ * 4691`) or in the mempool (`network.rs:4776, 4828`).
+ */
+const DUPLICATE_MESSAGES = Object.freeze(['Transaction already processed', 'Transaction already in mempool']);
+
+/**
+ * Error codes after which a submitted transaction may or may not have reached
+ * the node: the request was sent but no usable answer came back.
+ */
+const UNCERTAIN_SUBMIT_CODES = Object.freeze(['timeout', 'rpc_transport', 'rpc_http', 'rpc_json']);
+
 /** The two AMM swap methods that take 16 raw bytes (`contracts.rs:2419-2441`, `ledger.rs:2359-2365`). */
 const SWAP_METHODS = Object.freeze(['swap_a_to_b', 'swap_b_to_a']);
+
+/** Strict UTF-8 decoder: serde_json::from_slice refuses invalid UTF-8. */
+const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 /** Padded standard-alphabet base64, the form `base64::decode` / `crypto::base64_decode` accept (`crypto.rs:129-130`). */
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -209,72 +236,95 @@ function requireKeypair(keypair) {
 }
 
 /**
- * Validates a `u64` destined for a JSON body and returns it as a JS number.
- * `JSON.stringify` cannot carry an integer above 2^53-1 exactly and the node
- * reads these fields with `as_u64` from a JSON number (e.g.
- * `contracts.rs:2219-2225, 2381-2384, 2842-2850`), so larger values are refused.
- * @param {number|bigint} value
+ * Throws `RangeError` when `opts` has an own key outside `allowed`, so a
+ * misspelt or 4.x-style option (`page_size`, `min_rep`) is reported instead
+ * of being ignored. `renamed` maps a known old name to its replacement.
+ * @param {object} opts
+ * @param {ReadonlyArray<string>} allowed
+ * @param {string} field e.g. `'opts'`
+ * @param {Readonly<Record<string, string>>} [renamed={}]
+ * @returns {void}
+ * @throws {RangeError}
+ */
+function onlyKeys(opts, allowed, field, renamed = {}) {
+  for (const key of Object.keys(opts)) {
+    if (allowed.includes(key)) continue;
+    const hint = Object.prototype.hasOwnProperty.call(renamed, key) ? `; use ${renamed[key]}` : '';
+    throw new RangeError(`${field}.${key}: unknown option${hint} (allowed: ${allowed.join(', ')})`);
+  }
+}
+
+/**
+ * The `RpcError` (code `duplicate`) for a write-route reply saying the node
+ * already holds the transaction's signature. `message` stays the node's text.
+ * @param {RpcError} err The error `_request` / `parseSubmitResponse` raised.
+ * @param {string} route
+ * @param {string} signature
+ * @param {string} txBase64
+ * @returns {RpcError}
+ */
+function duplicateError(err, route, signature, txBase64) {
+  const dup = new RpcError(err.message, {
+    code: 'duplicate',
+    route: err.route === null ? `POST ${route}` : err.route,
+    httpStatus: err.httpStatus,
+    body: err.body,
+    nodeStatus: err.nodeStatus,
+    hint: err.hint,
+    cause: err,
+  });
+  dup.signature = signature;
+  dup.txBase64 = txBase64;
+  return dup;
+}
+
+/**
+ * An integer `min..=max` page parameter. The node clamps these values
+ * silently; the SDK refuses values outside the range instead.
+ * @param {unknown} value
  * @param {string} field
+ * @param {number} min
+ * @param {number} max
+ * @param {string} cite node `file:line` of the clamp, and advice
  * @returns {number}
  * @throws {TypeError|RangeError}
  */
-function jsonU64(value, field) {
-  const big = normalizeU64(value, field);
-  if (big > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw new RangeError(`${field}: ${big} exceeds 2^53-1 and cannot be carried exactly in a JSON number`);
-  }
-  return Number(big);
+function boundedInt(value, field, min, max, cite) {
+  const v = pageInt(value, field, min);
+  if (v > max) throw new RangeError(`${field}: ${v} is above ${max}; the node would clamp it to ${max} (${cite})`);
+  return v;
 }
 
 /**
- * Deep-copies a JSON-serialisable value, converting `bigint` to `number`
- * where exact (`<= 2^53-1`) and refusing anything `JSON.stringify` would
- * silently alter (`NaN`/`Infinity` → `null`, `undefined`/functions dropped,
- * bytes → `{"type":"Buffer",...}`).
- * @param {unknown} value
- * @param {string} field
- * @returns {unknown}
- * @throws {TypeError|RangeError}
+ * RFC 3986 `pchar` minus `%`: characters `fetch` sends unchanged in a path
+ * segment. The node's router passes the raw segment to `FromStr` without
+ * percent-decoding it (warp 0.3.7 `path::param`, `filters/path.rs:266-275,
+ * 443-460`; `Cargo.lock` pins warp 0.3.7), so an escaped character would
+ * reach the node in its escaped spelling.
  */
-function jsonValue(value, field) {
-  if (value === null) return null;
-  const t = typeof value;
-  if (t === 'string') return assertString(value, field);
-  if (t === 'boolean') return value;
-  if (t === 'number') {
-    if (!Number.isFinite(value)) throw new RangeError(`${field}: ${describe(value)} is not representable in JSON`);
-    return value;
-  }
-  if (t === 'bigint') {
-    if (value < 0n) return Number(value) >= Number.MIN_SAFE_INTEGER
-      ? Number(value)
-      : (() => { throw new RangeError(`${field}: ${value}n is below -(2^53-1) and cannot be carried exactly in a JSON number`); })();
-    return jsonU64(value, field);
-  }
-  if (Array.isArray(value)) return value.map((v, i) => jsonValue(v, `${field}[${i}]`));
-  if (isPlainObject(value)) {
-    const out = {};
-    for (const key of Object.keys(value)) {
-      if (value[key] === undefined) continue;
-      out[key] = jsonValue(value[key], `${field}.${key}`);
-    }
-    return out;
-  }
-  throw new TypeError(`${field}: expected a JSON value (object, array, string, number, bigint, boolean or null), got ${describe(value)}`);
-}
+const PATH_SEGMENT = /^[A-Za-z0-9\-._~!$&'()*+,;=:@]+$/;
 
 /**
- * Validates and percent-encodes one path segment.
+ * Validates one path segment and returns it unencoded.
  * @param {unknown} value
  * @param {string} field
  * @returns {string}
  * @throws {TypeError} Not a string.
- * @throws {RangeError} Empty string.
+ * @throws {RangeError} Empty, `.` or `..` (the URL parser removes them), or a
+ *   character outside RFC 3986 `pchar` (space, `/`, `?`, `#`, `%`, `[`, `]`,
+ *   `"`, `<`, `>`, `\`, `^`, `` ` ``, `{`, `|`, `}`, control or non-ASCII
+ *   characters), which would have to be percent-encoded and the node does not
+ *   decode.
  */
 function seg(value, field) {
   assertString(value, field);
   if (value.length === 0) throw new RangeError(`${field}: must not be empty`);
-  return encodeURIComponent(value);
+  if (value === '.' || value === '..' || !PATH_SEGMENT.test(value)) {
+    throw new RangeError(
+      `${field}: ${describe(value)} cannot be sent as a URL path segment: the node's router (warp 0.3 path::param) does not percent-decode, so only RFC 3986 pchar characters other than '%' reach it unchanged, and '.' / '..' are removed by URL parsing; read it from a list route (getTokens, getTasks, getRwaTokens) instead`,
+    );
+  }
+  return value;
 }
 
 /**
@@ -376,36 +426,6 @@ function port(value, field) {
     throw new RangeError(`${field}: expected an integer 1..65535, got ${describe(value)}`);
   }
   return value;
-}
-
-/**
- * Reads the three fields of an encoded `ContractCall` (variant 4,
- * `token.rs:60-64`): `String contract_id`, `String method`, `Vec<u8> args`,
- * each `u64le` length-prefixed (bincode 1 fixint). Trailing bytes are not
- * rejected, matching `bincode::deserialize`'s legacy options.
- * @param {Buffer} data Encoded instruction whose variant is 4.
- * @returns {{contractId: string, method: string, args: Buffer}}
- * @throws {EncodingError} When the data is truncated.
- */
-function readContractCall(data) {
-  let offset = 4;
-  const read = (name) => {
-    if (offset + 8 > data.length) {
-      throw new EncodingError(`innerInstruction: truncated ContractCall (no length prefix for ${name})`, { field: 'innerInstruction' });
-    }
-    const len = data.readBigUInt64LE(offset);
-    offset += 8;
-    if (len > BigInt(data.length - offset)) {
-      throw new EncodingError(`innerInstruction: truncated ContractCall (${name} claims ${len} bytes, ${data.length - offset} remain)`, { field: 'innerInstruction' });
-    }
-    const slice = data.subarray(offset, offset + Number(len));
-    offset += Number(len);
-    return slice;
-  };
-  const contractId = read('contract_id').toString('utf8');
-  const method = read('method').toString('utf8');
-  const args = Buffer.from(read('args'));
-  return { contractId, method, args };
 }
 
 /**
@@ -854,48 +874,75 @@ const checks = Object.freeze({
   },
 
   /**
-   * AgentExecute inner-instruction allow-list (`ledger.rs:6425-6485`):
-   * the inner variant must be one of `AGENT_INNER_VARIANTS`; Stake/Unstake
-   * are accepted by the dispatcher but execute as no-ops
-   * (`FeatureDisabledError 'agentStake'`, `token.rs:1183-1200`); a nested
-   * AgentExecute/ConditionalOrder is refused at ingress (`ledger.rs:1439`);
-   * for an inner ContractCall the args must be a JSON object
-   * (`ledger.rs:6436-6442`; a 16-byte swap payload → `'agentSwap'`), the
-   * method must be in `DELEGATED_CALL_METHODS` (`ledger.rs:2138-2175`, else
-   * `'agentDelegatedMethod'`) and the target may not be an `agent_registry_`
-   * contract (`ledger.rs:6428-6431`). Launchpad/RWA targets and protected
-   * protocol methods are also rejected by the node (`ledger.rs:6554-6561,
-   * 2184-2240`) but need state to recognise.
+   * AgentExecute inner-instruction rules (`ledger.rs:6399-6485, 6522,
+   * 6648-6655`): the inner bytes must decode as a `XerisInstruction`
+   * (`decodeInstruction`; else the block skips it after charging the fee,
+   * `ledger.rs:6399-6405`); a nested AgentExecute/ConditionalOrder is
+   * refused at ingress (`ledger.rs:1439`); the inner variant must be one of
+   * `AGENT_INNER_VARIANTS`; Stake/Unstake are accepted by the dispatcher but
+   * execute as no-ops (`FeatureDisabledError 'agentStake'`,
+   * `token.rs:1183-1200`); an inner TokenTransfer/TokenBurn runs through the
+   * token processor as the owner, so its `from` must be `ownerPubkey`
+   * (`token.rs:1104, 1151`); for an inner ContractCall the args must be a
+   * JSON object serde_json parses (no invalid UTF-8, lone surrogate or
+   * out-of-range number; `ledger.rs:6436-6442`; a 16-byte swap payload →
+   * `'agentSwap'`), the method must be in `DELEGATED_CALL_METHODS`
+   * (`ledger.rs:2138-2175`, else `'agentDelegatedMethod'`) and the target may
+   * not be an `agent_registry_` contract (`ledger.rs:6428-6431`).
+   * Launchpad/RWA targets and protected protocol methods are also rejected by
+   * the node (`ledger.rs:6554-6561, 2184-2240`) but need state to recognise.
    * @param {Buffer|Uint8Array} innerData Encoded inner instruction.
+   * @param {string} ownerPubkey The AgentExecute `owner_pubkey` the inner instruction runs as.
    * @throws {TypeError|EncodingError|RangeError|FeatureDisabledError|XerisError}
    */
-  agentInner(innerData) {
+  agentInner(innerData, ownerPubkey) {
     const data = toBytes(innerData, 'innerInstruction');
-    const variant = readVariant(data);
+    assertString(ownerPubkey, 'ownerPubkey');
+    const decoded = tryDecodeInstruction(data);
+    if (!decoded.ok) {
+      throw new EncodingError(
+        `innerInstruction: does not decode as a XerisInstruction (${decoded.reason}); the block skips it after charging the fee (ledger.rs:6399-6405)`,
+        { field: 'innerInstruction' },
+      );
+    }
+    const { variant, name, fields } = decoded.value;
     if (variant === Variant.AgentExecute || variant === Variant.ConditionalOrder) {
-      throw new RangeError(`innerInstruction: nested ${VARIANT_NAMES[variant]} (variant ${variant}) is rejected at ingress (ledger.rs:1439)`);
+      throw new RangeError(`innerInstruction: nested ${name} (variant ${variant}) is rejected at ingress (ledger.rs:1439)`);
     }
     if (!AGENT_INNER_VARIANTS.includes(variant)) {
-      const name = variant < VARIANT_NAMES.length ? VARIANT_NAMES[variant] : 'unknown';
       throw new RangeError(`innerInstruction: AgentExecute inner instruction type not in allowlist (${name}, variant ${variant}); allowed: ${AGENT_OPERATIONS.join(', ')} (ledger.rs:6425-6485)`);
     }
     if (variant === Variant.Stake || variant === Variant.Unstake) {
       throw disabledFeature('agentStake');
     }
+    if ((variant === Variant.TokenTransfer || variant === Variant.TokenBurn) && fields.from !== ownerPubkey) {
+      // ledger.rs:6522, 6648-6655 run the inner instruction with owner_pubkey as the
+      // signer; token.rs:1104 / 1151 then refuse a different `from`.
+      throw new RangeError(
+        `innerInstruction: nested ${name}.from ${fields.from} is not the AgentExecute owner ${ownerPubkey}; the block runs it as the owner and drops it after charging the fee (ledger.rs:6522, 6648-6655; token.rs:${variant === Variant.TokenTransfer ? 1104 : 1151})`,
+      );
+    }
     if (variant === Variant.ContractCall) {
-      const { contractId, method, args } = readContractCall(data);
+      const contractId = fields.contract_id;
+      const method = fields.method;
+      const args = fields.args;
       if (contractId.startsWith('agent_registry_')) {
         throw new RangeError(`innerInstruction: delegated calls to agent registries are rejected by the node (contract '${contractId}', ledger.rs:6428-6431)`);
       }
+      // serde_json::from_slice::<Value> (ledger.rs:6436-6442) refuses invalid UTF-8,
+      // lone surrogates and out-of-range numbers; parseJson with forNode mirrors it.
       let parsed;
+      let why = 'not a JSON object';
       try {
-        parsed = JSON.parse(args.toString('utf8'));
-      } catch (_) {
+        parsed = parseJson(STRICT_UTF8.decode(args), 'innerInstruction.args', { forNode: true });
+      } catch (err) {
+        if (!(err instanceof SyntaxError || err instanceof RangeError || err instanceof TypeError)) throw err;
         parsed = undefined;
+        why = err.message;
       }
       if (!isPlainObject(parsed)) {
         if (SWAP_METHODS.includes(method)) throw disabledFeature('agentSwap');
-        throw new XerisError(`innerInstruction: delegated ContractCall args must be a JSON object so the node can bound the spend; method '${method}' carried ${args.length} non-object bytes (ledger.rs:6436-6442)`);
+        throw new XerisError(`innerInstruction: delegated ContractCall args must be a JSON object the node can parse so it can bound the spend; method '${method}' carried ${args.length} bytes that are not (${why}) (ledger.rs:6436-6442)`);
       }
       if (!DELEGATED_CALL_METHODS.includes(method)) {
         throw disabledFeature('agentDelegatedMethod');
@@ -1084,7 +1131,12 @@ class XerisClient {
   // --------------------------------------------------------------------------
 
   /**
-   * One HTTP round trip with the D6 error rule.
+   * One HTTP round trip with the D6 error rule. The request body is written
+   * with `stringifyJson` (a `bigint` becomes an exact JSON integer; values
+   * `JSON.stringify` would drop or rewrite throw) and the response is read
+   * with `parseJson`, so integers above 2^53-1 (token balances and supplies
+   * on 10^18-unit tokens, `tokens_out`, a plan's `min_tokens_out`) arrive as
+   * `bigint` with their exact value; every other number is a `number`.
    * @private
    * @param {'GET'|'POST'} method
    * @param {string} url Absolute URL.
@@ -1109,11 +1161,7 @@ class XerisClient {
     const init = { method, headers: { Accept: 'application/json' } };
     if (body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
-      try {
-        init.body = JSON.stringify(body);
-      } catch (cause) {
-        throw new TypeError(`${route}: request body cannot be serialised as JSON (${causeText(cause)})`);
-      }
+      init.body = stringifyJson(body, 'body');
     }
     const controller = new AbortController();
     init.signal = controller.signal;
@@ -1135,11 +1183,13 @@ class XerisClient {
 
     let data;
     let parsed = false;
+    let parseError = null;
     try {
-      data = JSON.parse(text);
+      data = parseJson(text, 'response');
       parsed = true;
-    } catch (_) {
+    } catch (e) {
       data = undefined;
+      parseError = e;
     }
 
     if (!resp.ok) {
@@ -1157,7 +1207,9 @@ class XerisClient {
       });
     }
     if (!parsed) {
-      throw new RpcError(`${route}: response is not JSON (${text.length} bytes)`, { code: 'rpc_json', route, httpStatus: resp.status, body: text });
+      throw new RpcError(`${route}: response is not usable JSON (${text.length} bytes): ${causeText(parseError)}`, {
+        code: 'rpc_json', route, httpStatus: resp.status, body: text, cause: parseError,
+      });
     }
     // D6: handlers reply HTTP 200 with {"error": "..."} on failure (network.rs:4825-4843 and
     // every warp::reply::json error branch; explorer.rs:1063, 1077, 1103, 1246, 1963).
@@ -1276,6 +1328,18 @@ class XerisClient {
    * Unstake `network.rs:4464-4474`, `/pq-register` → PqKeyRegister
    * `network.rs:4597-4602`). `status: 'ok'`/`'queued'` means mempool
    * admission, not confirmation: poll `waitForConfirmation`.
+   *
+   * Retrying: when the request was sent but no usable answer came back
+   * (`code` `timeout`, `rpc_transport`, `rpc_http`, `rpc_json`), the node may
+   * already hold the transaction. The error then carries `err.signature` and
+   * `err.txBase64`. Do not call `sendInstruction` again: it fetches a new
+   * blockhash and signs a second transaction with a new signature, which the
+   * node's signature-based duplicate check (`network.rs:4686-4692,
+   * 4772-4778`) does not catch, so the transfer can execute twice. Instead poll
+   * `waitForConfirmation(err.signature)`, or resend the same bytes with
+   * `submitSignedTransaction(err.txBase64)` while the blockhash is valid
+   * (150 slots); a copy the node already holds is answered with an
+   * `RpcError` of code `duplicate`.
    * @param {XerisKeypair} keypair Signer and fee payer (`BASE_TX_FEE` per transaction, `ledger.rs:58`).
    * @param {Buffer|Uint8Array|Array<Buffer|Uint8Array>} instructionData One encoded instruction or 1..16 of them.
    * @param {{route?: '/submit'|'/stake'|'/unstake'|'/pq-register'}} [opts={}] Default route `'/submit'`.
@@ -1284,13 +1348,16 @@ class XerisClient {
    * @throws {RangeError} 0 or more than 16 instructions, an unknown route, an oversize instruction, or a
    *   first instruction that does not match the dedicated route.
    * @throws {EncodingError|FeatureDisabledError} From `assertInstructionSubmittable`.
-   * @throws {RpcError|XerisError} Node rejection (`network.rs:4664-4858`), transport failure or timeout.
+   * @throws {RpcError|XerisError} Node rejection (`network.rs:4664-4858`), transport failure or timeout;
+   *   after the request was sent, `timeout` / `rpc_transport` / `rpc_http` / `rpc_json` / `duplicate`
+   *   errors carry `.signature` and `.txBase64`.
    */
   async sendInstruction(keypair, instructionData, opts = {}) {
     requireKeypair(keypair);
     if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
       throw new TypeError(`opts: expected an object, got ${describe(opts)}`);
     }
+    onlyKeys(opts, ['route'], 'opts');
     const route = opts.route === undefined ? '/submit' : opts.route;
     if (!WRITE_ROUTES.includes(route)) {
       throw new RangeError(`opts.route: expected one of ${WRITE_ROUTES.map((r) => `'${r}'`).join(', ')}, got ${describe(route)} (network.rs:4336, 4440, 4571, 4664)`);
@@ -1309,21 +1376,68 @@ class XerisClient {
       throw new RangeError(`opts.route: POST ${route} requires the first instruction to be ${VARIANT_NAMES[required]} (variant ${required}), got ${VARIANT_NAMES[variants[0]]} (variant ${variants[0]})`);
     }
     const blockhash = await this.getLatestBlockhash();
-    const { txBytes } = assembleSignedTransaction(keypair, list, blockhash);
-    const data = await this._post(`${this.#rpcUrl}${route}`, submitBody(txBytes));
-    return parseSubmitResponse(data, `POST ${route}`, 200);
+    const { txBytes, txBase64, signature } = assembleSignedTransaction(keypair, list, blockhash);
+    return this._submit(route, submitBody(txBytes), txBase64, signature);
+  }
+
+  /**
+   * Posts `{tx_base64}` to a write route and parses the reply. When the request
+   * was sent but its outcome is unknown (`timeout`, `rpc_transport`,
+   * `rpc_http`, `rpc_json`), the error gets `signature` and `txBase64` so the
+   * caller can poll or resend the same bytes instead of signing again. A node
+   * reply saying it already holds the signature becomes `RpcError` with code
+   * `duplicate` and the same two properties.
+   * @private
+   * @param {string} route One of `WRITE_ROUTES`.
+   * @param {{tx_base64: string}} body
+   * @param {string} txBase64
+   * @param {string} signature base58 first signature of the transaction.
+   * @returns {Promise<import('./transaction').SubmitResult>}
+   * @throws {RpcError|XerisError}
+   */
+  async _submit(route, body, txBase64, signature) {
+    const label = `POST ${route}`;
+    let data;
+    try {
+      data = await this._post(`${this.#rpcUrl}${route}`, body);
+    } catch (err) {
+      if (err instanceof XerisError && UNCERTAIN_SUBMIT_CODES.includes(err.code)) {
+        err.signature = signature;
+        err.txBase64 = txBase64;
+        err.message = `${err.message}; the node may hold transaction ${signature}: poll waitForConfirmation(err.signature) or resend err.txBase64 with submitSignedTransaction, do not sign again`;
+        throw err;
+      }
+      if (err instanceof RpcError && DUPLICATE_MESSAGES.includes(err.message)) {
+        throw duplicateError(err, route, signature, txBase64);
+      }
+      throw err;
+    }
+    try {
+      return parseSubmitResponse(data, label, 200);
+    } catch (err) {
+      if (err instanceof RpcError && DUPLICATE_MESSAGES.includes(err.message)) {
+        throw duplicateError(err, route, signature, txBase64);
+      }
+      throw err;
+    }
   }
 
   /**
    * Submits an already signed and serialized transaction (for example from a
-   * wallet provider via `serializedFromWalletResult`) as `{tx_base64}`.
+   * wallet provider via `serializedFromWalletResult`, or `err.txBase64` from a
+   * send that timed out) as `{tx_base64}`. Resending identical bytes is safe:
+   * the node deduplicates by first signature and answers a copy it already
+   * holds with `Transaction already processed` / `Transaction already in
+   * mempool` (`network.rs:4690-4692, 4774-4777`), raised here as `RpcError`
+   * with code `duplicate` and `.signature`.
    * @param {string} txBase64 Padded standard base64 of the serialized transaction, at most `MAX_TX_BYTES` (`tx_pool.rs:183`).
    * @param {'/submit'|'/stake'|'/unstake'|'/pq-register'} [route='/submit']
    * @returns {Promise<import('./transaction').SubmitResult>}
    * @throws {TypeError} Non-string input.
-   * @throws {EncodingError} Not padded base64 or too short to hold a signature.
+   * @throws {EncodingError} Not padded base64, too short to hold a signature, or not a single-signature transaction.
    * @throws {RangeError} Unknown route or oversize transaction.
-   * @throws {RpcError|XerisError}
+   * @throws {RpcError|XerisError} As `sendInstruction`, including `.signature` / `.txBase64` on an uncertain outcome
+   *   and code `duplicate`.
    */
   async submitSignedTransaction(txBase64, route = '/submit') {
     if (typeof txBase64 !== 'string') throw new TypeError(`txBase64: expected a base64 string, got ${describe(txBase64)}`);
@@ -1340,8 +1454,7 @@ class XerisClient {
     if (bytes.length > MAX_TX_BYTES) {
       throw new RangeError(`txBase64: ${bytes.length} bytes exceeds MAX_TX_BYTES = ${MAX_TX_BYTES} (tx_pool.rs:183)`);
     }
-    const data = await this._post(`${this.#rpcUrl}${route}`, { tx_base64: txBase64 });
-    return parseSubmitResponse(data, `POST ${route}`, 200);
+    return this._submit(route, { tx_base64: txBase64 }, txBase64, signatureOf(bytes));
   }
 
   /**
@@ -1356,7 +1469,7 @@ class XerisClient {
    * @param {{timeoutMs?: number, intervalMs?: number}} [opts={}] Defaults:
    *   `timeoutMs = BLOCKHASH_EXPIRY_WINDOW * SLOT_MS` (600000), `intervalMs = SLOT_MS` (4000).
    * @returns {Promise<TxDetail>}
-   * @throws {TypeError|RangeError} Bad arguments.
+   * @throws {TypeError|RangeError} Bad arguments, including an unknown `opts` key.
    * @throws {XerisError} code `'timeout'`: `transaction <sig> not found within <ms> ms (the node only searches its last 1000 in-memory blocks)`.
    * @throws {RpcError} Any explorer error other than `Transaction not found`.
    */
@@ -1366,6 +1479,7 @@ class XerisClient {
     if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
       throw new TypeError(`opts: expected an object, got ${describe(opts)}`);
     }
+    onlyKeys(opts, ['timeoutMs', 'intervalMs'], 'opts');
     const timeoutMs = opts.timeoutMs === undefined ? BLOCKHASH_EXPIRY_WINDOW * SLOT_MS : pageInt(opts.timeoutMs, 'opts.timeoutMs', 0);
     const intervalMs = opts.intervalMs === undefined ? SLOT_MS : pageInt(opts.intervalMs, 'opts.intervalMs', 0);
     const started = Date.now();
@@ -1673,8 +1787,10 @@ class XerisClient {
   /**
    * ContractDeploy (variant 5). `contractId` must satisfy
    * `checks.contractId` and `contractType` `checks.contractType`; `params`
-   * is sent as JSON (`params_json`), with `bigint` values converted to JSON
-   * numbers when ≤ 2^53-1.
+   * is sent as JSON (`params_json`) written by `stringifyJson`: a `bigint`
+   * is written as an exact integer (e.g. a launchpad `total_supply` of
+   * `10n ** 18n`), and an integer `number` above 2^53-1, `NaN`, `undefined`
+   * or a non-plain object throws.
    * @param {XerisKeypair} keypair Owner.
    * @param {string} contractId
    * @param {string} contractType `ContractType::from_str` alias, e.g. `'swap'`, `'escrow'`, `'launchpad'` (`contracts.rs:385-411`).
@@ -1688,7 +1804,7 @@ class XerisClient {
     checks.contractId(contractId);
     checks.contractType(contractType);
     if (!isPlainObject(params)) throw new TypeError(`params: expected a plain object, got ${describe(params)}`);
-    const paramsJson = JSON.stringify(jsonValue(params, 'params'));
+    const paramsJson = stringifyJson(params, 'params');
     return this.sendInstruction(keypair, Instructions.contractDeploy(contractId, contractType, paramsJson));
   }
 
@@ -1697,7 +1813,12 @@ class XerisClient {
    * be the 16 raw bytes `u64le(input) ‖ u64le(min_output)`
    * (`contracts.rs:2419-2441`; see `swap`); for every other method it must be
    * a plain object sent as JSON (`ledger.rs:2359-2371`; shapes in blueprint
-   * §7.3), with `bigint` values converted to JSON numbers when ≤ 2^53-1.
+   * §7.3), written by `stringifyJson`: `bigint` values become exact JSON
+   * integers (the node reads u64 fields with `as_u64`, which is exact up to
+   * 2^64-1); an integer `number` above 2^53-1, `NaN`/`Infinity`, `undefined`
+   * and functions throw, because `JSON.stringify` would round, null or drop
+   * them and the node reads a missing slippage field as 0
+   * (`contracts.rs:2849-2850, 2946-2947`).
    * The node injects `current_slot` into JSON args (`ledger.rs:2360-2365`).
    * Protocol contract ids such as `xeris_channels` are valid call targets.
    * @param {XerisKeypair} keypair Caller.
@@ -1723,7 +1844,7 @@ class XerisClient {
       if (!isPlainObject(args)) {
         throw new TypeError(`args: expected a plain object for method '${method}' (sent as JSON, ledger.rs:2359-2371), got ${describe(args)}`);
       }
-      payload = jsonValue(args, 'args');
+      payload = args;
     }
     return this.sendInstruction(keypair, Instructions.contractCall(contractId, method, payload));
   }
@@ -1805,11 +1926,11 @@ class XerisClient {
     requireKeypair(keypair);
     assertString(poolId, 'poolId');
     const args = {
-      amount_a: jsonU64(amountA, 'amountA'),
-      amount_b: jsonU64(amountB, 'amountB'),
-      min_lp_shares: jsonU64(minLpShares, 'minLpShares'),
-      min_amount_a: jsonU64(minAmountA, 'minAmountA'),
-      min_amount_b: jsonU64(minAmountB, 'minAmountB'),
+      amount_a: normalizeU64(amountA, 'amountA'),
+      amount_b: normalizeU64(amountB, 'amountB'),
+      min_lp_shares: normalizeU64(minLpShares, 'minLpShares'),
+      min_amount_a: normalizeU64(minAmountA, 'minAmountA'),
+      min_amount_b: normalizeU64(minAmountB, 'minAmountB'),
     };
     checks.liquidityArgs(args);
     return this.sendInstruction(keypair, Instructions.contractCall(poolId, 'add_liquidity', args));
@@ -1832,9 +1953,9 @@ class XerisClient {
     assertString(poolId, 'poolId');
     checks.positive(shares, 'shares');
     const args = {
-      shares: jsonU64(shares, 'shares'),
-      min_amount_a: jsonU64(minAmountA, 'minAmountA'),
-      min_amount_b: jsonU64(minAmountB, 'minAmountB'),
+      shares: normalizeU64(shares, 'shares'),
+      min_amount_a: normalizeU64(minAmountA, 'minAmountA'),
+      min_amount_b: normalizeU64(minAmountB, 'minAmountB'),
     };
     return this.sendInstruction(keypair, Instructions.contractCall(poolId, 'remove_liquidity', args));
   }
@@ -1856,7 +1977,7 @@ class XerisClient {
     requireKeypair(keypair);
     assertString(launchpadId, 'launchpadId');
     checks.positive(xrsAmount, 'xrsAmount');
-    const args = { xrs_amount: jsonU64(xrsAmount, 'xrsAmount'), min_tokens_out: jsonU64(minTokensOut, 'minTokensOut') };
+    const args = { xrs_amount: normalizeU64(xrsAmount, 'xrsAmount'), min_tokens_out: normalizeU64(minTokensOut, 'minTokensOut') };
     return this.sendInstruction(keypair, Instructions.contractCall(launchpadId, 'buy_tokens', args));
   }
 
@@ -1875,7 +1996,7 @@ class XerisClient {
     requireKeypair(keypair);
     assertString(launchpadId, 'launchpadId');
     checks.positive(tokenAmount, 'tokenAmount');
-    const args = { token_amount: jsonU64(tokenAmount, 'tokenAmount'), min_xrs_out: jsonU64(minXrsOut, 'minXrsOut') };
+    const args = { token_amount: normalizeU64(tokenAmount, 'tokenAmount'), min_xrs_out: normalizeU64(minXrsOut, 'minXrsOut') };
     return this.sendInstruction(keypair, Instructions.contractCall(launchpadId, 'sell_tokens', args));
   }
 
@@ -2032,8 +2153,12 @@ class XerisClient {
    * ConditionalOrder (variant 23): escrows `lockedAmount` and executes
    * `innerInstruction` when the condition holds (`ledger.rs:6916-7122`).
    * `conditionType` ∈ `CONDITION_TYPES`; the inner instruction is at most
-   * `MAX_CONDITIONAL_INNER_BYTES` (2048), must be an admissible instruction
-   * and not a nested AgentExecute/ConditionalOrder (`ledger.rs:1439`);
+   * `MAX_CONDITIONAL_INNER_BYTES` (2048, `ledger.rs:6941-6944`), must decode
+   * as a `XerisInstruction` (`ledger.rs:6923-6927`), pass
+   * `assertInstructionSubmittable`, and not be a nested
+   * AgentExecute/ConditionalOrder (`ledger.rs:1439`); an inner token
+   * instruction runs as the signer when the order fires, so its `from` /
+   * `mint_authority` must be the signer (checked by `buildTransaction`);
    * `lockedAmount` ≥ `ORDER_STORAGE_BOND` (`ledger.rs:6998-7002`);
    * `expiresAtSlot` must be in the future and within `MAX_ORDER_LIFETIME_SLOTS`.
    * @param {XerisKeypair} keypair Order owner.
@@ -2053,7 +2178,14 @@ class XerisClient {
     checks.oneOf(conditionType, CONDITION_TYPES, 'conditionType');
     const inner = toBytes(innerInstruction, 'innerInstruction');
     if (inner.length > MAX_CONDITIONAL_INNER_BYTES) {
-      throw new RangeError(`innerInstruction: ${inner.length} bytes exceeds the node's ${MAX_CONDITIONAL_INNER_BYTES}-byte cap (ledger.rs:6942)`);
+      throw new RangeError(`innerInstruction: ${inner.length} bytes exceeds the node's ${MAX_CONDITIONAL_INNER_BYTES}-byte cap (ledger.rs:6941-6944)`);
+    }
+    const decoded = tryDecodeInstruction(inner);
+    if (!decoded.ok) {
+      throw new EncodingError(
+        `innerInstruction: does not decode as a XerisInstruction (${decoded.reason}); the block skips it after charging the fee (ledger.rs:6923-6927)`,
+        { field: 'innerInstruction' },
+      );
     }
     const innerVariant = assertInstructionSubmittable(inner);
     if (innerVariant === Variant.AgentExecute || innerVariant === Variant.ConditionalOrder) {
@@ -2122,17 +2254,27 @@ class XerisClient {
   /**
    * HardwareAttest (variant 27). `deviceType` ∈ `DEVICE_TYPES`
    * (`ledger.rs:7232-7237`); `attestationProof` is the device key's 64-byte
-   * Ed25519 signature over the `XRS_HW_ATTEST_V2` challenge
+   * Ed25519 signature over `hardwareAttestChallenge(devicePubkey,
+   * boundIdentity, deviceType, manufacturer, model, firmwareVersion, slot)`
    * (`ledger.rs:7311-7332`, challenge at `ledger.rs:5299-5319`); the signer
    * must be the device when `boundIdentity` is empty and must be the bound
    * identity otherwise (`ledger.rs:7239-7252`).
+   *
+   * `slot` must be the slot of the block that includes this transaction: the
+   * node rebuilds the challenge with `block.slot` (`ledger.rs:7320-7322`) and
+   * allows no window. That slot is not known in advance, so a proof succeeds
+   * only if the transaction lands in exactly the block it was signed for;
+   * otherwise the dispatcher skips the instruction after charging the fee and
+   * the call must be repeated with a proof for a later slot. The resolved
+   * `status: 'ok'` means mempool admission only; check the outcome with
+   * `waitForConfirmation`.
    * @param {XerisKeypair} keypair Device key or bound identity.
    * @param {string} devicePubkey
    * @param {string} deviceType
    * @param {string} manufacturer
    * @param {string} model
    * @param {string} firmwareVersion
-   * @param {Buffer|Uint8Array} attestationProof 64 bytes.
+   * @param {Buffer|Uint8Array} attestationProof 64-byte device signature over the challenge for the including block's slot.
    * @param {string} boundIdentity Identity public key, or `''`.
    * @returns {Promise<import('./transaction').SubmitResult>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
@@ -2834,14 +2976,17 @@ class XerisClient {
    * `POST /agent/plan` with a free-form body carrying `action`. Returns the
    * instruction the node suggests (`AgentPlan`, blueprint §12.4); convert
    * with `fromPlan`. An unknown action is reported as `RpcError`
-   * (`network.rs:5568-5572`). Body cap 16 KiB (`network.rs:5388`).
+   * (`network.rs:5568-5572`). Body cap 16 KiB (`network.rs:5388`). The body
+   * is written with `stringifyJson` (exact `bigint`), and the response is
+   * read with `parseJson`, so a plan's u64 values above 2^53-1 (a launchpad
+   * `min_tokens_out`) arrive as `bigint` and `fromPlan` encodes them exactly.
    * @param {object} body Plain JSON object, e.g. `{action: 'transfer', from, to, amount_xrs}`.
    * @returns {Promise<object>} The plan.
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async agentPlan(body) {
     if (!isPlainObject(body)) throw new TypeError(`body: expected a plain object with an 'action' field, got ${describe(body)}`);
-    return this._post(`${this.#rpcUrl}/agent/plan`, jsonValue(body, 'body'));
+    return this._post(`${this.#rpcUrl}/agent/plan`, body);
   }
 
   /**
@@ -2865,36 +3010,48 @@ class XerisClient {
    * Plans an AMM swap (`network.rs:5417-5481`): resolves the direction,
    * quotes the output and returns the 16-byte swap args as a byte array
    * (`params.args`, `network.rs:5455`) with `min_amount_out` derived from
-   * `slippagePct` (`0..100`, node default 5 when omitted).
+   * `slippagePct`. `slippagePct` is required and always sent: the node
+   * would otherwise apply 5% (`network.rs:5421`).
    * @param {string} poolId
    * @param {string} tokenIn
    * @param {number|bigint} amountIn Base units.
-   * @param {number} [slippagePct] Percent, 0..100; omitted → node default 5.0 (`network.rs:5421`).
+   * @param {number} slippagePct Percent, 0..100.
    * @returns {Promise<object>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async planSwap(poolId, tokenIn, amountIn, slippagePct) {
+    arity(arguments.length, 4, 'planSwap', 'poolId, tokenIn, amountIn, slippagePct');
     assertString(poolId, 'poolId');
     assertString(tokenIn, 'tokenIn');
-    const body = { action: 'swap', pool_id: poolId, token_in: tokenIn, amount_in: jsonU64(amountIn, 'amountIn') };
-    if (slippagePct !== undefined) body.slippage_pct = jsonNumber(slippagePct, 'slippagePct', 0, 100);
-    return this.agentPlan(body);
+    return this.agentPlan({
+      action: 'swap',
+      pool_id: poolId,
+      token_in: tokenIn,
+      amount_in: normalizeU64(amountIn, 'amountIn'),
+      slippage_pct: jsonNumber(slippagePct, 'slippagePct', 0, 100),
+    });
   }
 
   /**
    * Plans a Launchpad buy (`network.rs:5482-5533`); `params.args` is the JSON
-   * object `{xrs_amount, min_tokens_out}` for `buy_tokens`.
+   * object `{xrs_amount, min_tokens_out}` for `buy_tokens`. `slippagePct` is
+   * required and always sent: the node would otherwise apply 5%
+   * (`network.rs:5485`).
    * @param {string} launchpadId
    * @param {number|bigint} xrsAmount Lamports of wrapped XRS.
-   * @param {number} [slippagePct] Percent, 0..100; omitted → node default 5.0.
+   * @param {number} slippagePct Percent, 0..100.
    * @returns {Promise<object>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async planBuyLaunchpad(launchpadId, xrsAmount, slippagePct) {
+    arity(arguments.length, 3, 'planBuyLaunchpad', 'launchpadId, xrsAmount, slippagePct');
     assertString(launchpadId, 'launchpadId');
-    const body = { action: 'buy_launchpad', launchpad_id: launchpadId, xrs_amount: jsonU64(xrsAmount, 'xrsAmount') };
-    if (slippagePct !== undefined) body.slippage_pct = jsonNumber(slippagePct, 'slippagePct', 0, 100);
-    return this.agentPlan(body);
+    return this.agentPlan({
+      action: 'buy_launchpad',
+      launchpad_id: launchpadId,
+      xrs_amount: normalizeU64(xrsAmount, 'xrsAmount'),
+      slippage_pct: jsonNumber(slippagePct, 'slippagePct', 0, 100),
+    });
   }
 
   /**
@@ -2932,6 +3089,8 @@ class XerisClient {
 
   // --------------------------------------------------------------------------
   // Read methods, RPC port (blueprint §10.6; network.rs)
+  // Path parameters go through `seg`: sent unencoded, refused when the node
+  // could not receive them unchanged.
   // --------------------------------------------------------------------------
 
   /**
@@ -2946,8 +3105,10 @@ class XerisClient {
   /**
    * `GET /blocks` (`network.rs:4555-4559`): up to 50 newest blocks, newest
    * first, as raw `ledger::Block` serde (`ledger.rs:294-331`). `hash`,
-   * `merkle_root`, `previous_hash`, `poh_hash`, `proposer_sig` are JSON byte
-   * arrays, not hex; `poh_timestamp` is Unix milliseconds.
+   * `merkle_root`, `previous_hash`, `poh_hash`, `proposer` (a `Pubkey`,
+   * serialised as its 32 raw bytes; base58-encode it to display) and
+   * `proposer_sig` are JSON byte arrays, not hex or base58; `poh_timestamp`
+   * is Unix milliseconds.
    * @returns {Promise<object[]>}
    * @throws {RpcError|XerisError}
    */
@@ -2959,7 +3120,7 @@ class XerisClient {
    * `GET /stake/{address}` (`network.rs:4866-4899`). An unparseable address
    * is treated as the default key and returns zeros.
    * @param {string} address
-   * @returns {Promise<{address: string, stake: number, stake_xrs: number, isValidator: boolean, blocksProposed: number,
+   * @returns {Promise<{address: string, stake: number|bigint, stake_xrs: number, isValidator: boolean, blocksProposed: number,
    *   staking_apy_pct: number, earns_staking_rewards: boolean, estimated_hourly_reward_lamports: number,
    *   estimated_hourly_reward_xrs: number, estimated_annual_reward_xrs: number, min_stake_for_rewards_xrs: number}>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
@@ -2973,7 +3134,7 @@ class XerisClient {
    * `start_time`, `end_time` and `unlock_time` fields are slot × 4 seconds,
    * not Unix epoch (`network.rs:5694`).
    * @param {string} address
-   * @returns {Promise<{address: string, count: number, sessions: Array<{id: string, amount: number, start_time: number,
+   * @returns {Promise<{address: string, count: number, sessions: Array<{id: string, amount: number|bigint, start_time: number,
    *   end_time: number, start_slot: number, unlock_time: number}>}>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
@@ -3053,8 +3214,8 @@ class XerisClient {
    * @param {string} contractId Swap pool id.
    * @param {string} inputToken Token id being sold.
    * @param {number|bigint} amount Base units, > 0.
-   * @returns {Promise<{success: true, quote: {input_token: string, input_amount: number, output_token: string,
-   *   output_amount: number, fee: number, fee_bps: number, price_impact_pct: string, effective_price: number}}>}
+   * @returns {Promise<{success: true, quote: {input_token: string, input_amount: number|bigint, output_token: string,
+   *   output_amount: number|bigint, fee: number|bigint, fee_bps: number, price_impact_pct: string, effective_price: number}}>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async getContractQuote(contractId, inputToken, amount) {
@@ -3093,7 +3254,7 @@ class XerisClient {
    * execution-equivalent math `contracts.rs:296-333`). `price_impact_pct` is a number here.
    * @param {string} contractId Launchpad id.
    * @param {number|bigint} xrsAmountLamports Wrapped XRS to spend, in lamports, > 0.
-   * @returns {Promise<{xrs_amount: number, tokens_out: number, creator_fee: number, xeris_fee: number, total_fees: number,
+   * @returns {Promise<{xrs_amount: number|bigint, tokens_out: number|bigint, creator_fee: number|bigint, xeris_fee: number|bigint, total_fees: number|bigint,
    *   effective_price: number, price_after: number, price_impact_pct: number}>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
@@ -3132,18 +3293,33 @@ class XerisClient {
    * provider identity is active, sorted by reputation, filtered by the given
    * parameters (`region` also matches listings whose region is `'global'`;
    * `maxPrice` also matches `price_per_unit` 0). Only supplied parameters are
-   * sent; the node defaults `limit` to 50.
+   * sent; the node defaults `limit` to 50. Keys use camelCase; the node's
+   * query names (`min_rep`, `max_price`, which 4.x passed through) and any
+   * other unknown key throw instead of being dropped. The node joins `tags`
+   * with `,` and trims each tag (`network.rs:5593-5594`), so a tag that is
+   * empty, contains `,` or has leading/trailing whitespace is refused.
    * @param {{category?: string, tags?: string[], region?: string, minRep?: number|bigint, maxPrice?: number|bigint, limit?: number}} [params={}]
    * @returns {Promise<{success: true, data: object[]}>} `CapabilityListing` rows (`contracts.rs:805-818`).
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async searchCapabilities(params = {}) {
     if (!isPlainObject(params)) throw new TypeError(`params: expected an object, got ${describe(params)}`);
+    onlyKeys(params, ['category', 'tags', 'region', 'minRep', 'maxPrice', 'limit'], 'params', {
+      min_rep: 'minRep', max_price: 'maxPrice',
+    });
     const q = [];
     if (params.category !== undefined) q.push(['category', assertString(params.category, 'params.category')]);
     if (params.tags !== undefined) {
       if (!Array.isArray(params.tags)) throw new TypeError(`params.tags: expected an array of strings, got ${describe(params.tags)}`);
-      q.push(['tags', params.tags.map((t, i) => assertString(t, `params.tags[${i}]`)).join(',')]);
+      const tags = params.tags.map((t, i) => {
+        const field = `params.tags[${i}]`;
+        assertString(t, field);
+        if (t.length === 0 || t.includes(',') || t.trim() !== t) {
+          throw new RangeError(`${field}: '${t}' is empty, contains ',' or has surrounding whitespace; the node splits tags on ',' and trims them (network.rs:5593-5594)`);
+        }
+        return t;
+      });
+      q.push(['tags', tags.join(',')]);
     }
     if (params.region !== undefined) q.push(['region', assertString(params.region, 'params.region')]);
     if (params.minRep !== undefined) q.push(['min_rep', normalizeU64(params.minRep, 'params.minRep').toString()]);
@@ -3250,7 +3426,7 @@ class XerisClient {
    * `GET /governance/lock/{address}` (`network.rs:5821-5833`). Readable even
    * though the lock/delegate write routes are disabled.
    * @param {string} address
-   * @returns {Promise<{address: string, locked_amount: number, locked_xrs: number, delegate: string|null}>}
+   * @returns {Promise<{address: string, locked_amount: number|bigint, locked_xrs: number, delegate: string|null}>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async getGovernanceLock(address) {
@@ -3261,17 +3437,24 @@ class XerisClient {
    * `GET /price-history?pool_id=&limit=` (`network.rs:6026-6075`): the last
    * `limit` snapshots of a pool's node-local price file (one per 100 blocks,
    * `ledger.rs:3785-3788`). The node caps `limit` at 10,080
-   * (`network.rs:6030-6033`); the caller's value is sent unchanged.
-   * @param {string} poolId
-   * @param {number} [limit=500] The node's own default (`network.rs:6032`).
+   * (`network.rs:6030-6033`) and drops every `pool_id` character outside
+   * `[A-Za-z0-9_-]` (`network.rs:6036-6039`), so the SDK refuses a larger
+   * `limit` and a `poolId` that does not match `CONTRACT_ID_PATTERN` rather
+   * than read a different pool's file. A pool with no price file returns
+   * `{pair: 'XRS-xUSDC', count: 0}`, not an error (`network.rs:6050-6068`).
+   * @param {string} poolId Contract id of the pool (`CONTRACT_ID_PATTERN`).
+   * @param {number} [limit=500] `0..=PRICE_HISTORY_MAX_LIMIT`; 500 is the node's own default (`network.rs:6032`).
    * @returns {Promise<{pair: string, count: number, history: Array<{slot: number, timestamp_ms: number, price: number,
-   *   tvl: number, token_a: string, token_b: string, total_fees_lamports: number}>}>}
+   *   tvl: number, token_a: string, token_b: string, total_fees_lamports: number|bigint}>}>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async getPriceHistory(poolId, limit = 500) {
     assertString(poolId, 'poolId');
-    if (poolId.length === 0) throw new RangeError('poolId: must not be empty');
-    return this._get(withQuery(`${this.#rpcUrl}/price-history`, [['pool_id', poolId], ['limit', pageInt(limit, 'limit', 0)]]));
+    if (!CONTRACT_ID_PATTERN.test(poolId)) {
+      throw new RangeError(`poolId: ${describe(poolId)} is not 1..128 characters of [A-Za-z0-9_-]; the node strips other characters and would read another pool's file (network.rs:6036-6039)`);
+    }
+    const lim = boundedInt(limit, 'limit', 0, PRICE_HISTORY_MAX_LIMIT, 'network.rs:6030-6033');
+    return this._get(withQuery(`${this.#rpcUrl}/price-history`, [['pool_id', poolId], ['limit', lim]]));
   }
 
   /**
@@ -3303,15 +3486,17 @@ class XerisClient {
   /**
    * `GET /v2/blocks?page=&page_size=` (`explorer.rs:1014-1034`): newest-first
    * summaries over the ≤ 1000 in-memory blocks; `hash` is hex. The node
-   * clamps `page_size` to 1..100 (`explorer.rs:276-299`).
+   * clamps `page_size` to 1..100 (`explorer.rs:280, 1020`); the SDK refuses
+   * a value outside that range instead.
    * @param {number} [page=1]
-   * @param {number} [pageSize=20]
+   * @param {number} [pageSize=20] `1..=LIST_MAX_PAGE_SIZE` (100).
    * @returns {Promise<{success: true, data: Array<{slot: number, hash: string, proposer: string, tx_count: number,
    *   poh_timestamp: number}>, pagination: {total: number, page: number, page_size: number, total_pages: number}}>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async getBlocks(page = 1, pageSize = 20) {
-    return this._get(withQuery(`${this.#explorerUrl}/v2/blocks`, [['page', pageInt(page, 'page', 1)], ['page_size', pageInt(pageSize, 'pageSize', 1)]]));
+    const size = boundedInt(pageSize, 'pageSize', 1, LIST_MAX_PAGE_SIZE, 'explorer.rs:280, 1020');
+    return this._get(withQuery(`${this.#explorerUrl}/v2/blocks`, [['page', pageInt(page, 'page', 1)], ['page_size', size]]));
   }
 
   /**
@@ -3341,14 +3526,17 @@ class XerisClient {
 
   /**
    * `GET /v2/transactions?page=&page_size=` (`explorer.rs:1109-1180`):
-   * newest-first across in-memory blocks; `page_size` clamped to 1..100.
+   * newest-first across in-memory blocks. The node clamps `page_size` to
+   * 1..100 (`explorer.rs:1114, 1125`); the SDK refuses a value outside that
+   * range instead.
    * @param {number} [page=1]
-   * @param {number} [pageSize=20]
+   * @param {number} [pageSize=20] `1..=LIST_MAX_PAGE_SIZE` (100).
    * @returns {Promise<{success: true, data: object[], pagination: object}>} `TransactionSummary` rows (`explorer.rs:75-88`).
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async getTransactions(page = 1, pageSize = 20) {
-    return this._get(withQuery(`${this.#explorerUrl}/v2/transactions`, [['page', pageInt(page, 'page', 1)], ['page_size', pageInt(pageSize, 'pageSize', 1)]]));
+    const size = boundedInt(pageSize, 'pageSize', 1, LIST_MAX_PAGE_SIZE, 'explorer.rs:1114, 1125');
+    return this._get(withQuery(`${this.#explorerUrl}/v2/transactions`, [['page', pageInt(page, 'page', 1)], ['page_size', size]]));
   }
 
   /**
@@ -3367,7 +3555,7 @@ class XerisClient {
    * `GET /v2/account/{address}` (`explorer.rs:1251-1284`); never 404s, an
    * unknown address returns zeros.
    * @param {string} address
-   * @returns {Promise<{success: true, data: {address: string, balance: number, balance_xrs: number, stake: number,
+   * @returns {Promise<{success: true, data: {address: string, balance: number|bigint, balance_xrs: number, stake: number|bigint,
    *   is_validator: boolean, blocks_proposed: number}}>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
@@ -3378,24 +3566,49 @@ class XerisClient {
   /**
    * `GET /v2/account/{address}/transactions?page=&page_size=&before=`
    * (`explorer.rs:1287-1375`), served from the receipt store: one row per
-   * committed instruction, `tx_type` prefixed `sent:`/`received:`. `page` is
-   * clamped to 1..50 and `page_size` to 1..200 by the node; when `before`
-   * (the previous response's `cursor`) is given, `page` is ignored.
+   * committed instruction, `tx_type` prefixed `sent:`/`received:`. The node
+   * clamps `page` to 1..50 and `page_size` to 1..200 (`explorer.rs:1305-1307`,
+   * `tx_store.rs:57`); the SDK refuses values outside those ranges instead,
+   * because a clamped page silently repeats page 50 while
+   * `pagination.total_pages` can exceed 50. Past page 50, pass the previous
+   * response's `cursor` as `before`. The node ignores `page` when `before`
+   * is present (`explorer.rs:1321-1322`), so the SDK refuses the two together
+   * and sends `page` only without `before`.
+   *
+   * 4.x took `(address, page, pageSize)`; a non-object second argument now
+   * throws `TypeError` rather than being ignored.
    * @param {string} address
    * @param {{page?: number, pageSize?: number, before?: number}} [opts={}] Defaults `page = 1`, `pageSize = 20`.
    * @returns {Promise<{success: true, data: object[], pagination: object, cursor: number|null}>}
-   * @throws {TypeError|RangeError|RpcError|XerisError}
+   * @throws {TypeError} `opts` is not a plain object (for example a 4.x positional page number).
+   * @throws {RangeError} An unknown key, `page` outside 1..50, `pageSize` outside 1..200, or both `page` and `before`.
+   * @throws {RpcError|XerisError}
    */
-  async getAccountTransactions(address, { page = 1, pageSize = 20, before } = {}) {
-    const q = [['page', pageInt(page, 'page', 1)], ['page_size', pageInt(pageSize, 'pageSize', 1)]];
-    if (before !== undefined) q.push(['before', pageInt(before, 'before', 0)]);
+  async getAccountTransactions(address, opts = {}) {
+    if (!isPlainObject(opts)) {
+      throw new TypeError(`opts: expected {page, pageSize, before}, got ${describe(opts)}; 5.0 no longer takes positional page arguments`);
+    }
+    onlyKeys(opts, ['page', 'pageSize', 'before'], 'opts', { page_size: 'pageSize' });
+    if (opts.page !== undefined && opts.before !== undefined) {
+      throw new RangeError('opts: pass either page or before, not both; the node ignores page when before is present (explorer.rs:1321-1322)');
+    }
+    const pageSize = opts.pageSize === undefined ? 20 : boundedInt(opts.pageSize, 'opts.pageSize', 1, ACCOUNT_HISTORY_MAX_PAGE_SIZE,
+      'explorer.rs:1307, tx_store.rs:57');
+    let q;
+    if (opts.before !== undefined) {
+      q = [['page_size', pageSize], ['before', pageInt(opts.before, 'opts.before', 0)]];
+    } else {
+      const page = opts.page === undefined ? 1 : boundedInt(opts.page, 'opts.page', 1, ACCOUNT_HISTORY_MAX_PAGE,
+        'explorer.rs:1300-1306; past page 50 pass the previous response\'s cursor as opts.before');
+      q = [['page', page], ['page_size', pageSize]];
+    }
     return this._get(withQuery(`${this.#explorerUrl}/v2/account/${seg(address, 'address')}/transactions`, q));
   }
 
   /**
    * `GET /v2/validators` (`explorer.rs:1377-1410`): every address with stake,
    * unordered, no minimum-stake filter.
-   * @returns {Promise<{success: true, data: Array<{address: string, stake: number, stake_percentage: number,
+   * @returns {Promise<{success: true, data: Array<{address: string, stake: number|bigint, stake_percentage: number,
    *   blocks_proposed: number}>, total_staked: number, total_staked_xrs: number, validator_count: number}>}
    * @throws {RpcError|XerisError}
    */
@@ -3419,17 +3632,22 @@ class XerisClient {
 
   /**
    * Validates the `{after, limit}` cursor options of the registry routes.
-   * The node clamps `limit` to 1..32 (`REGISTRY_PAGE_ITEMS`, `explorer.rs:126, 168`);
-   * the caller's value is sent unchanged.
+   * The node clamps `limit` to 1..32 (`REGISTRY_PAGE_ITEMS`, `explorer.rs:126,
+   * 168`); the SDK refuses values outside that range and unknown keys
+   * instead of letting them be clamped or ignored.
    * @private
    * @param {unknown} opts
    * @returns {Array<[string, string|number|undefined]>}
+   * @throws {TypeError|RangeError}
    */
   _cursorQuery(opts) {
     if (!isPlainObject(opts)) throw new TypeError(`opts: expected an object, got ${describe(opts)}`);
+    onlyKeys(opts, ['after', 'limit'], 'opts', { page_size: 'limit', pageSize: 'limit' });
     const q = [];
     if (opts.after !== undefined) q.push(['after', assertString(opts.after, 'opts.after')]);
-    if (opts.limit !== undefined) q.push(['limit', pageInt(opts.limit, 'opts.limit', 0)]);
+    if (opts.limit !== undefined) {
+      q.push(['limit', boundedInt(opts.limit, 'opts.limit', 1, REGISTRY_PAGE_ITEMS, 'explorer.rs:126, 168')]);
+    }
     return q;
   }
 
@@ -3497,7 +3715,9 @@ class XerisClient {
    * `GET /v2/contract/{id}?page=&page_size=` (`explorer.rs:1843-1967`).
    * Model, Capability, Device and Heartbeat registries return a page object
    * (`page_size` clamped to 1..32, default 16); every other contract returns
-   * `{success, contract}` capped at 256 KiB. Only supplied parameters are sent.
+   * `{success, contract}` capped at 256 KiB. Only supplied parameters are sent;
+   * unknown keys and a `pageSize` above 32 throw instead of being ignored or
+   * clamped.
    * @param {string} contractId
    * @param {{page?: number, pageSize?: number}} [opts={}]
    * @returns {Promise<object>}
@@ -3506,9 +3726,12 @@ class XerisClient {
    */
   async getContractV2(contractId, opts = {}) {
     if (!isPlainObject(opts)) throw new TypeError(`opts: expected an object, got ${describe(opts)}`);
+    onlyKeys(opts, ['page', 'pageSize'], 'opts', { page_size: 'pageSize' });
     const q = [];
     if (opts.page !== undefined) q.push(['page', pageInt(opts.page, 'opts.page', 1)]);
-    if (opts.pageSize !== undefined) q.push(['page_size', pageInt(opts.pageSize, 'opts.pageSize', 1)]);
+    if (opts.pageSize !== undefined) {
+      q.push(['page_size', boundedInt(opts.pageSize, 'opts.pageSize', 1, REGISTRY_PAGE_ITEMS, 'explorer.rs:1855-1856')]);
+    }
     return this._get(withQuery(`${this.#explorerUrl}/v2/contract/${seg(contractId, 'contractId')}`, q));
   }
 
@@ -3531,16 +3754,19 @@ class XerisClient {
 
   /**
    * JSON-RPC `getBalance` (`explorer.rs:1447-1457`): native balance in
-   * lamports; an unknown address is 0.
+   * lamports; an unknown address is 0. The node sends a JSON integer; a
+   * balance above 2^53-1 lamports (about 9,007,199 XRS) is returned as a
+   * `bigint` with its exact value, anything smaller as a `number`. Both are
+   * accepted by `lamportsToXrs`.
    * @param {string} address
-   * @returns {Promise<number>} Lamports.
+   * @returns {Promise<number|bigint>} Lamports.
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async getBalance(address) {
     assertString(address, 'address');
     if (address.length === 0) throw new RangeError('address: must not be empty');
     const result = await this._jsonRpc('getBalance', [address]);
-    if (!isPlainObject(result) || typeof result.value !== 'number') {
+    if (!isPlainObject(result) || (typeof result.value !== 'number' && typeof result.value !== 'bigint')) {
       throw new RpcError(`JSON-RPC getBalance: unexpected result shape ${describe(result)}`, { code: 'rpc_json', route: 'JSON-RPC getBalance', body: result });
     }
     return result.value;
@@ -3550,8 +3776,8 @@ class XerisClient {
    * JSON-RPC `getAccountInfo` (`explorer.rs:1459-1483`). The shape is the
    * node's own, not Solana's: `owner` is the literal `'system'`.
    * @param {string} address
-   * @returns {Promise<{context: {slot: number}, value: {lamports: number, owner: 'system', executable: false,
-   *   stake: number, isValidator: boolean}}>}
+   * @returns {Promise<{context: {slot: number}, value: {lamports: number|bigint, owner: 'system', executable: false,
+   *   stake: number|bigint, isValidator: boolean}}>}
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async getAccountInfoRpc(address) {
@@ -3586,7 +3812,7 @@ class XerisClient {
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async getBlockRpc(slot) {
-    const result = await this._jsonRpc('getBlock', [jsonU64(slot, 'slot')]);
+    const result = await this._jsonRpc('getBlock', [normalizeU64(slot, 'slot')]);
     return result === undefined ? null : result;
   }
 
@@ -3609,17 +3835,18 @@ class XerisClient {
   /**
    * JSON-RPC `getSignaturesForAddress` (`explorer.rs:1540-1555, 1605-1629`):
    * one row per committed instruction from the receipt store, newest first;
-   * `[]` on a node without a store. The node clamps `limit` to 200
-   * (`tx_store.rs:57`) and ignores `before`/`until`.
+   * `[]` on a node without a store. The store clamps `limit` to 1..200
+   * (`tx_store.rs:57, 351`), so the SDK refuses a value outside that range;
+   * the node ignores `before`/`until`.
    * @param {string} address
-   * @param {number} [limit=20] The node's own default (`explorer.rs:1545`).
+   * @param {number} [limit=20] `1..=SIGNATURES_MAX_LIMIT` (200); 20 is the node's own default (`explorer.rs:1545`).
    * @returns {Promise<object[]>} `{signature, slot, blockTime, err, from, to, amount, amount_xrs, tx_type, type}` rows.
    * @throws {TypeError|RangeError|RpcError|XerisError}
    */
   async getSignaturesForAddress(address, limit = 20) {
     assertString(address, 'address');
     if (address.length === 0) throw new RangeError('address: must not be empty');
-    const result = await this._jsonRpc('getSignaturesForAddress', [address, { limit: pageInt(limit, 'limit', 1) }]);
+    const result = await this._jsonRpc('getSignaturesForAddress', [address, { limit: boundedInt(limit, 'limit', 1, SIGNATURES_MAX_LIMIT, 'tx_store.rs:57, 351') }]);
     if (!Array.isArray(result)) {
       throw new RpcError(`JSON-RPC getSignaturesForAddress: unexpected result shape ${describe(result)}`, { code: 'rpc_json', route: 'JSON-RPC getSignaturesForAddress', body: result });
     }
@@ -3649,7 +3876,8 @@ class XerisClient {
    * @private
    * @param {unknown} result
    * @param {string} method
-   * @returns {number}
+   * @returns {number} Slot and height values; one above 2^53-1 (a `bigint` from
+   *   `parseJson`, about 10^9 years of 4 s slots) is reported as malformed.
    * @throws {RpcError}
    */
   _expectNumber(result, method) {

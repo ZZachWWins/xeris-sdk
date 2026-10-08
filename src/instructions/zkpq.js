@@ -54,6 +54,7 @@ const {
   encodeVariant,
   toBytes,
 } = require('../encoding');
+const { Buffer } = require('buffer');
 const { EncodingError, disabledFeature } = require('../errors');
 const { PQ_PUBLIC_KEY_LEN, PQ_ROTATE_TAG } = require('../constants');
 

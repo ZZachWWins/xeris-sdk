@@ -28,6 +28,7 @@
  * `src/client.js` (blueprint D2); this file only wires them to the wallet.
  */
 
+const { Buffer } = require('buffer');
 const { XerisClient, checks } = require('./client');
 const {
   assertInstructionSubmittable,
@@ -35,9 +36,13 @@ const {
   serializedFromWalletResult,
 } = require('./transaction');
 const { Instructions, encodeSwapCall } = require('./instructions/index');
-const { assertString, normalizeU64, toBytes, xrsToLamports } = require('./encoding');
+const {
+  assertString, normalizeU64, toBytes, xrsToLamports, stringifyJson,
+} = require('./encoding');
 const { XerisError, disabledFeature } = require('./errors');
-const { TESTNET_SEED, DEFAULT_RPC_PORT, MAX_IX_PER_TX } = require('./constants');
+const {
+  TESTNET_SEED, DEFAULT_RPC_PORT, DEFAULT_EXPLORER_PORT, MAX_IX_PER_TX,
+} = require('./constants');
 const bs58 = require('bs58');
 
 // ---------------------------------------------------------------------------
@@ -60,7 +65,6 @@ const SWAP_METHODS = Object.freeze(['swap_a_to_b', 'swap_b_to_a']);
 /** Poll interval of `waitForProvider`, in ms. */
 const PROVIDER_POLL_MS = 100;
 
-const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 /**
  * Short description of a value for error messages (never prints key material).
@@ -134,84 +138,46 @@ function assertArity(actual, expected, name, fields) {
   }
 }
 
-/**
- * Converts a u64 field value into a JSON number for a `ContractCall` args
- * object. The node parses these with `as_u64` from a JSON number
- * (`contracts.rs:2218-2224, 2381-2383, 2847-2850, 2944-2947`), and
- * `JSON.stringify` cannot carry an integer above 2^53-1 exactly, so larger
- * values are refused rather than rounded (blueprint §7.3).
- * @param {number|bigint} value
- * @param {string} field
- * @returns {number}
- * @throws {TypeError|RangeError}
- */
-function jsonU64(value, field) {
-  const v = normalizeU64(value, field);
-  if (v > MAX_SAFE_BIGINT) {
-    throw new RangeError(`${field}: JSON numbers above 2^53-1 cannot be carried exactly (the node reads a JSON number with as_u64); got ${v}`);
-  }
-  return Number(v);
-}
+
 
 /**
- * Deep-copies a caller-supplied JSON args object, converting `bigint` to a
- * JSON-safe number and refusing anything `JSON.stringify` would silently
- * alter or drop: non-finite numbers (become `null`), `undefined`, functions
- * and symbols (keys vanish), non-plain objects, and strings with a lone
- * surrogate (`serde_json` rejects the `\uD800` escape).
- * @param {unknown} value
- * @param {string} path field path for error messages
- * @returns {unknown}
- * @throws {TypeError|RangeError}
- */
-function jsonValue(value, path) {
-  if (typeof value === 'bigint') return jsonU64(value, path);
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new RangeError(`${path}: JSON cannot carry ${String(value)}`);
-    return value;
-  }
-  if (typeof value === 'string') return assertString(value, path);
-  if (typeof value === 'boolean' || value === null) return value;
-  if (Array.isArray(value)) return value.map((v, i) => jsonValue(v, `${path}[${i}]`));
-  if (value !== null && typeof value === 'object') {
-    if (!isPlainObject(value)) throw new TypeError(`${path}: expected a plain object or array, got ${describe(value)}`);
-    const out = {};
-    for (const key of Object.keys(value)) out[key] = jsonValue(value[key], `${path}.${key}`);
-    return out;
-  }
-  throw new TypeError(`${path}: ${typeof value} cannot be serialised to JSON`);
-}
-
-/**
- * Validates and copies a `ContractCall`/`ContractDeploy` JSON object argument.
+ * Checks that a `ContractCall`/`ContractDeploy` JSON argument is a plain
+ * object and returns it unchanged. Its values are checked when it is written
+ * by `stringifyJson` (inside `Instructions.contractCall`, or here for deploy
+ * parameters): `bigint` becomes an exact JSON integer, and anything
+ * `JSON.stringify` would round, null or drop throws.
  * @param {unknown} args
  * @param {string} field
  * @returns {object}
- * @throws {TypeError|RangeError}
+ * @throws {TypeError}
  */
 function jsonArgs(args, field) {
   if (!isPlainObject(args)) {
     throw new TypeError(`${field}: expected a plain object (JSON), got ${describe(args)}`);
   }
-  return jsonValue(args, field);
+  return args;
 }
 
 /**
- * Splits an absolute http(s) URL into the scheme+host part `XerisClient`
- * takes as `host` and, when the URL carries a port other than
- * `DEFAULT_RPC_PORT` (`main.rs:831, 839`), the full RPC base URL to pass as
- * `opts.rpcUrl` so that port is honoured.
+ * Interprets a node URL that names one of the two servers. Only a bare
+ * `scheme://host:<defaultPort>` (no path) identifies the node host, from
+ * which the other server's URL can be derived by port (RPC 56001, explorer
+ * 50008; `main.rs:831-832, 839-840`). Any other URL (another port, no port,
+ * a path behind a gateway) is kept exactly as given and says nothing about
+ * where the other server is.
  * @param {unknown} raw
  * @param {string} source what produced the value, for error messages
- * @returns {{host: string, rpcUrl: string|null}}
+ * @param {number} defaultPort `DEFAULT_RPC_PORT` or `DEFAULT_EXPLORER_PORT`
+ * @returns {{host: string|null, url: string}} `host` is set only for a bare default-port URL;
+ *   `url` is the input without trailing slashes.
  * @throws {XerisError} `code 'provider'` when `source` is the wallet, else `'config'`
  */
-function splitBaseUrl(raw, source) {
+function nodeUrl(raw, source, defaultPort) {
   const code = source.startsWith('provider.') ? 'provider' : 'config';
   if (typeof raw !== 'string' || raw.trim() === '') {
     throw new XerisError(`${source} returned ${describe(raw)}; expected an absolute http(s) URL`, { code });
   }
-  const text = raw.trim();
+  const text = raw.trim().replace(/\/+$/, '');
   let url;
   try {
     url = new URL(text);
@@ -221,11 +187,9 @@ function splitBaseUrl(raw, source) {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new XerisError(`${source} returned '${text}'; only http: and https: URLs are supported`, { code });
   }
-  const hostNoPort = url.port === '' ? url.host : url.host.slice(0, url.host.length - url.port.length - 1);
-  const host = `${url.protocol}//${hostNoPort}`;
-  const defaultPort = url.port === '' || url.port === String(DEFAULT_RPC_PORT);
-  const rpcUrl = defaultPort ? null : `${url.origin}${url.pathname.replace(/\/+$/, '')}`;
-  return { host, rpcUrl };
+  const bare = url.port === String(defaultPort) && (url.pathname === '/' || url.pathname === '')
+    && url.search === '' && url.hash === '' && url.username === '' && url.password === '';
+  return { host: bare ? `${url.protocol}//${url.hostname}` : null, url: text };
 }
 
 /**
@@ -268,8 +232,8 @@ function isCanonical(s) {
 /**
  * Normalises `Buffer | Buffer[]` into a `Buffer[]` of 1..`MAX_IX_PER_TX`
  * entries (`ledger.rs:94`; `network.rs:145-197`), running
- * `assertInstructionSubmittable` on each so a disabled variant or oversize
- * payload is refused before any I/O.
+ * `assertInstructionSubmittable` on each so a disabled variant, an oversize
+ * payload or data that does not decode is refused before any I/O.
  * @param {Buffer|Uint8Array|Array<Buffer|Uint8Array>} instructionData
  * @returns {Buffer[]}
  * @throws {TypeError|RangeError|EncodingError|FeatureDisabledError}
@@ -362,15 +326,17 @@ class XerisDApp {
   // --------------------------------------------------------------------------
 
   /**
-   * Returns the injected wallet provider: `window.xeris`, else `window.solana`
-   * when it has `isXeris`, else `window.solana`, else `null` (unchanged from 4.x).
+   * Returns the injected Xeris wallet provider: `window.xeris`, else
+   * `window.solana` when it sets `isXeris`, else `null`. A `window.solana`
+   * without `isXeris` (for example a Solana-only wallet) is not used: it would
+   * be asked to sign XerisCoin transactions. 4.x fell back to it; pass such a
+   * provider explicitly with `opts.provider` if that is intended.
    * @returns {object|null}
    */
   static detectProvider() {
     if (typeof window === 'undefined' || window === null) return null;
     if (window.xeris) return window.xeris;
-    if (window.solana && window.solana.isXeris) return window.solana;
-    if (window.solana) return window.solana;
+    if (window.solana && window.solana.isXeris === true) return window.solana;
     return null;
   }
 
@@ -431,16 +397,22 @@ class XerisDApp {
    * creates the internal `XerisClient`.
    *
    * Base URL precedence: `opts.rpcUrl`/`opts.explorerUrl` → `opts.host` →
-   * `await provider.getRpcUrl()` (port 56001 stripped to derive the host; any
-   * other port is kept as the RPC URL) → `http://TESTNET_SEED` when
+   * `await provider.getRpcUrl()` → `http://TESTNET_SEED` when
    * `opts.network === 'testnet'`; on `'mainnet'` with none of these,
    * `XerisError` (`code 'config'`).
+   *
+   * A `getRpcUrl()` result of the form `scheme://host:56001` (no path) names
+   * the node host, and the explorer is taken as `scheme://host:50008`. Any
+   * other URL (another port, no port, a path) is used unchanged as the RPC
+   * URL, and the explorer URL must then come from `opts.explorerUrl` or the
+   * provider's optional `getExplorerUrl()`; without either, `connect` throws
+   * `XerisError` (`code 'config'`) rather than guess.
    * @param {object} [opts={}]
    * @param {boolean} [opts.onlyIfTrusted=false] Passed to `provider.connect`.
    * @returns {Promise<{publicKey: string}>}
    * @throws {XerisError} `code 'provider'` when no provider is found, `provider.connect` is
    *   missing or rejects, or it returns no usable public key; `code 'config'` for mainnet
-   *   without a host.
+   *   without a host, or a non-default `getRpcUrl()` with no explorer URL available.
    * @throws {RangeError} when the wallet's public key is not canonical (`ledger.rs:1569-1577`)
    */
   async connect(opts = {}) {
@@ -460,7 +432,8 @@ class XerisDApp {
     if (typeof provider.connect !== 'function') throw providerError('wallet provider has no connect() method');
 
     // Fail before the wallet prompt when mainnet can never resolve a host.
-    if (this._client === null && this._network === 'mainnet' && typeof provider.getRpcUrl !== 'function') {
+    if (this._client === null && this._network === 'mainnet' && this._opts.rpcUrl === undefined
+      && typeof provider.getRpcUrl !== 'function') {
       throw new XerisError('mainnet requires opts.host or opts.rpcUrl, or a provider that implements getRpcUrl()', { code: 'config' });
     }
 
@@ -480,22 +453,7 @@ class XerisDApp {
     checks.pubkey(publicKey, 'publicKey');
 
     // 3. Node base URL.
-    if (this._client === null) {
-      if (typeof provider.getRpcUrl === 'function') {
-        let raw;
-        try {
-          raw = await provider.getRpcUrl();
-        } catch (e) {
-          throw providerError(`provider.getRpcUrl() failed: ${causeText(e)}`, e);
-        }
-        const { host, rpcUrl } = splitBaseUrl(raw, 'provider.getRpcUrl()');
-        this._client = new XerisClient(host, this._clientOptions(rpcUrl === null ? {} : { rpcUrl }));
-      } else if (this._network === 'testnet') {
-        this._client = new XerisClient(`http://${TESTNET_SEED}`, this._clientOptions());
-      } else {
-        throw new XerisError('mainnet requires opts.host or opts.rpcUrl, or a provider that implements getRpcUrl()', { code: 'config' });
-      }
-    }
+    if (this._client === null) this._client = await this._resolveClient(provider);
 
     // 4. State and event forwarding.
     this._provider = provider;
@@ -566,13 +524,22 @@ class XerisDApp {
    * `/submit` (`network.rs:1577-1578, 4664-4675`) and returns the parsed node
    * body. With only `provider.signAndSendTransaction` the wallet submits and
    * the result is normalised to `{status:'ok', signature}`.
+   *
+   * The transaction passes `buildTransaction`'s checks (refused variants and
+   * the node's semantic gate) before the wallet is asked to sign. When the
+   * signed bytes were posted but no usable answer came back, the error
+   * carries `signature` and `txBase64` (see `XerisClient.sendInstruction`):
+   * poll `waitForConfirmation(err.signature)` or resend `err.txBase64` with
+   * `client.submitSignedTransaction`, rather than asking the wallet to sign
+   * again.
    * @param {Buffer|Uint8Array|Array<Buffer|Uint8Array>} instructionData 1..16 encoded instructions
    * @returns {Promise<SubmitResult>}
    * @throws {XerisError} `code 'provider'` when not connected, the wallet implements neither
    *   signing method, rejects, or returns an unusable result
-   * @throws {FeatureDisabledError} for variants 22/48/49/52 (`ledger.rs:1445-1450, 8669-8828`)
-   * @throws {RangeError|EncodingError} for oversize or malformed instruction data
-   * @throws {RpcError} for any node error body
+   * @throws {FeatureDisabledError} for variants 22, 30, 48, 49, 52 (`ledger.rs:1445-1450, 7460-7464, 8669-8828`)
+   * @throws {RangeError|EncodingError} for oversize or malformed instruction data, or an instruction the
+   *   node's semantic gate rejects (`ledger.rs:1382-1455`)
+   * @throws {RpcError} for any node error body (code `duplicate` when the node already holds it)
    */
   async sendInstruction(instructionData) {
     this._requireConnected();
@@ -859,7 +826,7 @@ class XerisDApp {
     this._requireConnected();
     assertString(launchpadId, 'launchpadId');
     checks.positive(xrsAmount, 'xrsAmount');
-    const args = { xrs_amount: jsonU64(xrsAmount, 'xrsAmount'), min_tokens_out: jsonU64(minTokensOut, 'minTokensOut') };
+    const args = { xrs_amount: normalizeU64(xrsAmount, 'xrsAmount'), min_tokens_out: normalizeU64(minTokensOut, 'minTokensOut') };
     return this.sendInstruction(Instructions.contractCall(launchpadId, 'buy_tokens', args));
   }
 
@@ -877,7 +844,7 @@ class XerisDApp {
     this._requireConnected();
     assertString(launchpadId, 'launchpadId');
     checks.positive(tokenAmount, 'tokenAmount');
-    const args = { token_amount: jsonU64(tokenAmount, 'tokenAmount'), min_xrs_out: jsonU64(minXrsOut, 'minXrsOut') };
+    const args = { token_amount: normalizeU64(tokenAmount, 'tokenAmount'), min_xrs_out: normalizeU64(minXrsOut, 'minXrsOut') };
     return this.sendInstruction(Instructions.contractCall(launchpadId, 'sell_tokens', args));
   }
 
@@ -898,11 +865,11 @@ class XerisDApp {
     this._requireConnected();
     assertString(poolId, 'poolId');
     const args = {
-      amount_a: jsonU64(amountA, 'amountA'),
-      amount_b: jsonU64(amountB, 'amountB'),
-      min_lp_shares: jsonU64(minLpShares, 'minLpShares'),
-      min_amount_a: jsonU64(minAmountA, 'minAmountA'),
-      min_amount_b: jsonU64(minAmountB, 'minAmountB'),
+      amount_a: normalizeU64(amountA, 'amountA'),
+      amount_b: normalizeU64(amountB, 'amountB'),
+      min_lp_shares: normalizeU64(minLpShares, 'minLpShares'),
+      min_amount_a: normalizeU64(minAmountA, 'minAmountA'),
+      min_amount_b: normalizeU64(minAmountB, 'minAmountB'),
     };
     checks.liquidityArgs(args);
     return this.sendInstruction(Instructions.contractCall(poolId, 'add_liquidity', args));
@@ -924,9 +891,9 @@ class XerisDApp {
     assertString(poolId, 'poolId');
     checks.positive(shares, 'shares');
     const args = {
-      shares: jsonU64(shares, 'shares'),
-      min_amount_a: jsonU64(minAmountA, 'minAmountA'),
-      min_amount_b: jsonU64(minAmountB, 'minAmountB'),
+      shares: normalizeU64(shares, 'shares'),
+      min_amount_a: normalizeU64(minAmountA, 'minAmountA'),
+      min_amount_b: normalizeU64(minAmountB, 'minAmountB'),
     };
     return this.sendInstruction(Instructions.contractCall(poolId, 'remove_liquidity', args));
   }
@@ -935,8 +902,11 @@ class XerisDApp {
    * ContractCall (variant 4). For `swap_a_to_b`/`swap_b_to_a`, `args` must be
    * the 16 raw bytes (`contracts.rs:2419-2441`); for every other method it
    * must be a plain object, sent as JSON (`ledger.rs:2359-2365`; shapes in
-   * blueprint §7.3). `bigint` values are converted to JSON numbers when
-   * ≤ 2^53-1, otherwise refused.
+   * blueprint §7.3) by `stringifyJson`: `bigint` values become exact JSON
+   * integers; an integer `number` above 2^53-1, `NaN`/`Infinity`,
+   * `undefined` and functions throw instead of being rounded, nulled or
+   * dropped (a missing slippage field is read as 0 by the node,
+   * `contracts.rs:2849-2850, 2946-2947`).
    * @param {string} contractId
    * @param {string} method
    * @param {object|Buffer|Uint8Array} args
@@ -982,7 +952,7 @@ class XerisDApp {
     assertString(contractType, 'contractType');
     checks.contractId(contractId);
     checks.contractType(contractType);
-    const paramsJson = JSON.stringify(jsonArgs(params, 'params'));
+    const paramsJson = stringifyJson(jsonArgs(params, 'params'), 'params');
     return this.sendInstruction(Instructions.contractDeploy(contractId, contractType, paramsJson));
   }
 
@@ -1141,9 +1111,60 @@ class XerisDApp {
   // --------------------------------------------------------------------------
 
   /**
+   * Creates the internal client at `connect()` when the constructor options
+   * did not fix the node. The RPC URL comes from `opts.rpcUrl`, else
+   * `provider.getRpcUrl()`. A bare `scheme://host:56001` names the node host
+   * (explorer `host:50008`, unless `opts.explorerUrl` overrides it). Any other
+   * RPC URL is used unchanged and the explorer URL must come from
+   * `opts.explorerUrl` or `provider.getExplorerUrl()`; nothing is guessed.
+   * Without an RPC URL, testnet falls back to `TESTNET_SEED`.
+   * @private
+   * @param {object} provider
+   * @returns {Promise<XerisClient>}
+   * @throws {XerisError} `code 'provider'` when a provider URL method fails or returns a bad URL;
+   *   `code 'config'` when no explorer URL is available for a non-default RPC URL, or on mainnet without a host
+   */
+  async _resolveClient(provider) {
+    let rpcUrl = this._opts.rpcUrl;
+    if (rpcUrl === undefined && typeof provider.getRpcUrl === 'function') {
+      let raw;
+      try {
+        raw = await provider.getRpcUrl();
+      } catch (e) {
+        throw providerError(`provider.getRpcUrl() failed: ${causeText(e)}`, e);
+      }
+      const rpc = nodeUrl(raw, 'provider.getRpcUrl()', DEFAULT_RPC_PORT);
+      if (rpc.host !== null) return new XerisClient(rpc.host, this._clientOptions());
+      rpcUrl = rpc.url;
+    }
+    if (rpcUrl !== undefined) {
+      let explorerUrl = this._opts.explorerUrl;
+      if (explorerUrl === undefined && typeof provider.getExplorerUrl === 'function') {
+        let raw;
+        try {
+          raw = await provider.getExplorerUrl();
+        } catch (e) {
+          throw providerError(`provider.getExplorerUrl() failed: ${causeText(e)}`, e);
+        }
+        explorerUrl = nodeUrl(raw, 'provider.getExplorerUrl()', DEFAULT_EXPLORER_PORT).url;
+      }
+      if (explorerUrl === undefined) {
+        throw new XerisError(
+          `RPC URL '${rpcUrl}' is not <host>:${DEFAULT_RPC_PORT}, so the explorer URL cannot be derived from it; pass opts.explorerUrl or use a provider with getExplorerUrl()`,
+          { code: 'config' },
+        );
+      }
+      return new XerisClient(null, this._clientOptions({ rpcUrl, explorerUrl }));
+    }
+    if (this._network === 'testnet') return new XerisClient(`http://${TESTNET_SEED}`, this._clientOptions());
+    throw new XerisError('mainnet requires opts.host or opts.rpcUrl, or a provider that implements getRpcUrl()', { code: 'config' });
+  }
+
+  /**
    * Host derivable from the constructor options alone: `opts.host`; `null`
-   * when both URLs are given (XerisClient then needs no host); the origin of
-   * whichever single URL was given; `undefined` when nothing was given.
+   * when both URLs are given (XerisClient then needs no host); the host of a
+   * single URL only when it is a bare `scheme://host:<default port>`;
+   * otherwise `undefined` (the node is resolved at `connect()`).
    * @private
    * @returns {string|null|undefined}
    */
@@ -1151,8 +1172,16 @@ class XerisDApp {
     const { host, rpcUrl, explorerUrl } = this._opts;
     if (host !== undefined) return host;
     if (rpcUrl !== undefined && explorerUrl !== undefined) return null;
-    if (rpcUrl !== undefined) return splitBaseUrl(rpcUrl, 'opts.rpcUrl').host;
-    if (explorerUrl !== undefined) return splitBaseUrl(explorerUrl, 'opts.explorerUrl').host;
+    // One URL alone fixes the node only when it is a bare default-port URL;
+    // otherwise the other URL is resolved at connect() (_resolveClient).
+    if (rpcUrl !== undefined) {
+      const r = nodeUrl(rpcUrl, 'opts.rpcUrl', DEFAULT_RPC_PORT);
+      return r.host === null ? undefined : r.host;
+    }
+    if (explorerUrl !== undefined) {
+      const r = nodeUrl(explorerUrl, 'opts.explorerUrl', DEFAULT_EXPLORER_PORT);
+      return r.host === null ? undefined : r.host;
+    }
     return undefined;
   }
 

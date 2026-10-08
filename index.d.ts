@@ -12,9 +12,16 @@
  *  - `U64Input` (`number | bigint`): a `number` must be a safe integer; values
  *    above `2^53-1` must be passed as `bigint`. Negative, non-integer and
  *    out-of-range values throw `RangeError`; wrong types throw `TypeError`.
- *  - Node JSON responses carry `u64` fields as JSON numbers; they are typed
- *    `number` here because `JSON.parse` yields numbers (values above `2^53-1`
- *    lose precision in transit regardless of this file).
+ *  - Node JSON responses carry `u64` fields as JSON integers. The SDK parses
+ *    every response with `parseJson`: an integer above `2^53-1` arrives as a
+ *    `bigint` with its exact value, anything smaller as a `number`. Amount,
+ *    balance and supply fields that can exceed `2^53-1` (lamports, token base
+ *    units on 10^18-unit supplies) are typed `U64Output` (`number | bigint`);
+ *    slots, counts and timestamps are typed `number`.
+ *  - JSON written by the SDK (contract-call args, deploy params, request
+ *    bodies) goes through `stringifyJson`: a `bigint` is written as exact
+ *    digits; an integer `number` above `2^53-1`, `NaN`/`Infinity`,
+ *    `undefined` and functions throw.
  *  - `XrsInput` (`number | string`): an XRS amount with at most 9 fractional
  *    digits, converted exactly by `xrsToLamports`; pass a decimal string for
  *    amounts a `number` cannot represent exactly.
@@ -28,6 +35,12 @@ import type { Keypair, PublicKey, Transaction } from '@solana/web3.js';
 
 /** Unsigned 64-bit field input: a safe-integer `number` or a `bigint` in `0..=2^64-1`. */
 export type U64Input = number | bigint;
+
+/**
+ * A `u64` read from a node response: a `number` up to `2^53-1`, a `bigint`
+ * above it (exact; see `parseJson`). Accepted wherever a `U64Input` is.
+ */
+export type U64Output = number | bigint;
 
 /** Byte field input. `number[]` and strings are rejected by the runtime (`TypeError`). */
 export type BytesInput = Buffer | Uint8Array;
@@ -150,11 +163,11 @@ export type BuilderName =
 /** `.code` strings carried by every SDK error. */
 export type ErrorCode =
   | 'xeris' | 'encoding' | 'arity' | 'feature_disabled' | 'rpc' | 'rpc_http'
-  | 'rpc_transport' | 'rpc_json' | 'timeout' | 'config' | 'provider';
+  | 'rpc_transport' | 'rpc_json' | 'duplicate' | 'timeout' | 'config' | 'provider';
 
 /** Keys of `DISABLED_FEATURES`. */
 export type DisabledFeatureKey =
-  | 'SubDelegate' | 'ZkPrivateTransfer' | 'ZkIdentityProof' | 'PqSignedTransfer'
+  | 'SubDelegate' | 'QueryCapabilities' | 'ZkPrivateTransfer' | 'ZkIdentityProof' | 'PqSignedTransfer'
   | 'airdrop' | 'stakeClaim' | 'governanceRpcWrite' | 'governanceLock'
   | 'agentSwap' | 'agentLaunchpad' | 'agentRwa' | 'agentStake' | 'agentDelegatedMethod';
 
@@ -205,12 +218,21 @@ export class XerisError extends Error {
   details: object | null;
   /** Present when a `cause` was supplied. */
   cause?: unknown;
+  /**
+   * Set when a signed transaction was sent but the outcome is unknown (`code`
+   * `timeout`, `rpc_transport`, `rpc_http`, `rpc_json`) or the node already
+   * holds it (`duplicate`): the base58 transaction id. Poll
+   * `waitForConfirmation(signature)`; do not sign again.
+   */
+  signature?: string;
+  /** Set together with `signature`: the exact `tx_base64` that was sent, for `submitSignedTransaction`. */
+  txBase64?: string;
 }
 
 /**
  * Structural encoding failure: wrong argument count (`code: 'arity'`),
- * unknown variant index, oversize instruction data, malformed hex,
- * unreadable instruction bytes.
+ * unknown variant index, malformed hex, unreadable instruction bytes.
+ * (Oversize instruction data is a `RangeError`.)
  */
 export class EncodingError extends XerisError {
   constructor(message: string, opts?: XerisErrorOptions & { field?: string | null });
@@ -256,7 +278,12 @@ export class RpcError extends XerisError {
       hint?: string | null;
     },
   );
-  /** `'rpc'`, or `'rpc_http'` / `'rpc_transport'` / `'rpc_json'` from the transport layer. */
+  /**
+   * `'rpc'`, `'rpc_http'` / `'rpc_transport'` / `'rpc_json'` from the transport
+   * layer, or `'duplicate'` when a write route answers that it already holds
+   * the transaction (`Transaction already processed` / `Transaction already in
+   * mempool`, `network.rs:4690-4692, 4774-4777`).
+   */
   code: string;
   /** e.g. `'POST /submit'` or `'JSON-RPC getBalance'`, or `null`. */
   route: string | null;
@@ -544,6 +571,10 @@ export const ACCOUNT_HISTORY_MAX_PAGE_SIZE: 200;
 export const ACCOUNT_HISTORY_MAX_PAGE: 50;
 /** Maximum `page_size` on numbered list routes (`explorer.rs:276-299`). */
 export const LIST_MAX_PAGE_SIZE: 100;
+/** Maximum `limit` of JSON-RPC `getSignaturesForAddress`; the store clamps to 1..200 (`tx_store.rs:57, 351`). */
+export const SIGNATURES_MAX_LIMIT: 200;
+/** Maximum `limit` of `GET /price-history`; the node applies `.min(10_080)` (`network.rs:6030-6033`). */
+export const PRICE_HISTORY_MAX_LIMIT: 10080;
 /** Transaction status vocabulary (`explorer.rs:680-690`; `tx_store.rs:116-120`). */
 export const TX_STATUSES: readonly ['confirmed', 'failed', 'partial', 'included'];
 /** Maximum UTF-8 byte lengths of string fields enforced by the node. */
@@ -680,10 +711,14 @@ export function readVariant(data: BytesInput): number;
 /**
  * Converts an XRS amount to lamports exactly (9 decimals, `token.rs:901`):
  * `0.29` → `290000000n`, `'1234567.123456789'` → `1234567123456789n`.
- * A `number` is converted via `String(n)`, so values that render in exponent
- * form (`1e-7`) are refused; pass those as decimal strings.
+ * A `number` is converted only when it is certainly the decimal the caller
+ * wrote: a safe integer, or a non-integer with at most 15 significant digits.
+ * Longer numbers (`9999999.999999999` reads as the double printed `9999999.999999998`) and
+ * values that render in exponent form (`1e-7`) are refused; pass those as
+ * decimal strings.
  * @throws {TypeError} When `xrs` is not a number or string.
- * @throws {RangeError} Negative, `NaN`/`Infinity`, more than 9 fractional digits, exponent form, or above `2^64-1` lamports.
+ * @throws {RangeError} Negative, `NaN`/`Infinity`, more than 9 fractional digits, exponent form, an integer
+ *   `number` above `2^53-1`, a non-integer `number` with more than 15 significant digits, or above `2^64-1` lamports.
  */
 export function xrsToLamports(xrs: XrsInput, field?: string): bigint;
 
@@ -711,6 +746,29 @@ export function toBaseUnits(amount: XrsInput, decimals: number, field?: string):
  */
 export function fromBaseUnits(units: U64Input, decimals: number, field?: string): string;
 
+/**
+ * Serialises a value to JSON text without changing it (the SDK's writer for
+ * contract-call args, deploy params and request bodies). A `bigint` in
+ * `-2^63..2^64-1` is written as exact digits; an integer `number` above
+ * `2^53-1`, `NaN`/`Infinity` and a `bigint` outside that range throw
+ * `RangeError`; `undefined`, functions, symbols, array holes and non-plain
+ * objects (`Buffer`, `Date`, class instances) throw `TypeError`; strings and
+ * keys with a lone surrogate throw `RangeError`; cycles throw `TypeError`;
+ * nesting deeper than 127 (serde_json's limit) throws `RangeError`.
+ * @param field Root of the error paths, e.g. `'args'` (default `'json'`).
+ */
+export function stringifyJson(value: unknown, field?: string): string;
+
+/**
+ * Parses JSON text like `JSON.parse`, but an integer literal outside
+ * `±(2^53-1)` becomes a `bigint` with its exact value, a float outside the f64
+ * range throws `RangeError`, and a lone-surrogate string or key throws
+ * `RangeError`. With `opts.forNode`, integer literals must also lie in
+ * `-2^63..2^64-1` and nesting must not exceed 127 (the node's serde_json rules).
+ * @throws {SyntaxError} Malformed JSON (`.code === 'syntax'`).
+ */
+export function parseJson(text: string, field?: string, opts?: { forNode?: boolean }): unknown;
+
 /** 4.x name; the same function object as `encodeString`. */
 export const encodeBincodeString: typeof encodeString;
 /** 4.x name; the same function object as `encodeBytes`. */
@@ -725,9 +783,12 @@ export const encodeBincodeStringVec: typeof encodeStringVec;
 /**
  * `ContractCall.args` input. `Buffer`/`Uint8Array` is sent verbatim (the only
  * way to send the 16-byte AMM swap payload, see `encodeSwapCall`); a plain
- * object is `JSON.stringify`-ed (`bigint` values are not serialisable and throw
- * `TypeError`); a string must already be JSON text that parses as an object,
- * because the node refuses every other JSON value (`ledger.rs:2359-2371`).
+ * object is written with `stringifyJson`, so `bigint` values become exact JSON
+ * integers (the node reads u64 fields with `as_u64`, exact up to `2^64-1`) and
+ * values `JSON.stringify` would round, null or drop throw; a string must
+ * already be JSON text of an object that the node's serde_json reads unchanged
+ * (no `\ud800` escape, no `1e400`, integers within `-2^63..2^64-1`), because
+ * the node refuses every other payload (`ledger.rs:2359-2371`).
  */
 export type ContractCallArgs = BytesInput | Record<string, unknown> | string;
 
@@ -818,7 +879,14 @@ export interface InstructionBuilders {
   registerOracle(oracleId: string, description: string, feedType: string, updateIntervalSlots: U64Input, stakeAmount: U64Input): Buffer;
   /** Variant 26 (`token.rs:223-227`; handler `ledger.rs:7209-7228`). */
   oracleSubmit(oracleId: string, value: U64Input, metadata: string): Buffer;
-  /** Variant 27 (`token.rs:229-237`; handler `ledger.rs:7311-7332`). `attestationProof` is a 64-byte Ed25519 signature over the `XRS_HW_ATTEST_V2` challenge (`ledger.rs:5299-5319`). */
+  /**
+   * Variant 27 (`token.rs:361-369`; handler `ledger.rs:7311-7332`). `attestationProof`
+   * is the device key's 64-byte Ed25519 signature over
+   * `hardwareAttestChallenge(..., slot)`, where `slot` must be the slot of the
+   * block that includes the transaction (`ledger.rs:7320-7322`). That slot is
+   * not known in advance and the node allows no window: a proof for any other
+   * slot makes the dispatcher skip the instruction after the fee is charged.
+   */
   hardwareAttest(
     devicePubkey: string, deviceType: string, manufacturer: string, model: string, firmwareVersion: string,
     attestationProof: BytesInput, boundIdentity: string,
@@ -834,9 +902,10 @@ export interface InstructionBuilders {
     newPricePerUnit: Optional<U64Input>, newMaxConcurrent: Optional<U32Input>, newMetadata: Optional<string>, removed: boolean,
   ): Buffer;
   /**
-   * Variant 30 (`token.rs:261-267`). Encodes, but the dispatcher is a no-op
+   * Variant 30 (`token.rs:414-420`). Encodes, but the dispatcher is a no-op
    * (`ledger.rs:7460-7464`): the fee is charged and nothing is written or
-   * returned.
+   * returned, so `assertInstructionSubmittable` (and every send path) refuses
+   * it with `FeatureDisabledError` `'QueryCapabilities'`.
    * @deprecated Use `XerisClient.searchCapabilities` (`GET /capabilities/search`).
    */
   queryCapabilities(category: string, tags: readonly string[], region: string, minReputation: U8Input, maxPrice: U64Input): Buffer;
@@ -943,7 +1012,11 @@ export const VARIANT_NAMES: readonly VariantName[];
 /** Index → camelCase builder name (62 entries), aligned with `VARIANT_NAMES`. */
 export const BUILDER_NAMES: readonly BuilderName[];
 
-/** `true` for the variant indices in `DISABLED_VARIANTS` (22, 48, 49, 52). */
+/**
+ * `true` for the variant indices in `DISABLED_VARIANTS` (22, 48, 49, 52), whose
+ * builders throw. Variant 30 (QueryCapabilities) is not among them: its builder
+ * encodes, but `assertInstructionSubmittable` refuses to submit it.
+ */
 export function isDisabledVariant(index: number): boolean;
 
 /**
@@ -953,9 +1026,19 @@ export function isDisabledVariant(index: number): boolean;
  * `args` → `contractCall` (buy_launchpad), 9 → `stake`, 13 → `wrapXrs`,
  * 14 → `unwrapXrs`. `params.amount` is the node's `(amount_xrs * 1e9) as u64`
  * truncation (`network.rs:5399, 5537, 5549, 5560`); compare with
- * `xrsToLamports` before signing when exactness matters.
- * @throws {TypeError} `plan`/`plan.params` not an object, unsupported `variant_index`, `variant_name` mismatch, or a wrong-typed parameter.
- * @throws {RangeError} A numeric parameter that is not a safe integer, or a byte outside `0..=255`.
+ * `xrsToLamports` before signing when exactness matters. Every u64 in the
+ * plan, including `params.args.xrs_amount` / `min_tokens_out` of a
+ * `buy_tokens` plan, must be an integer in `0..=2^64-1`, as a safe-integer
+ * `number` or a `bigint` (a negative `min_tokens_out` would read as `None`
+ * and remove the slippage floor, `contracts.rs:2849-2850`): plans from
+ * `XerisClient` are parsed with `parseJson` and keep values above `2^53-1`
+ * exact; a plan parsed with `JSON.parse` has already rounded them and throws
+ * here. A `buy_tokens` args object must hold exactly
+ * `xrs_amount` and `min_tokens_out`.
+ * @throws {TypeError} `plan`/`plan.params` not an object, unsupported `variant_index`, `variant_name` mismatch,
+ *   a wrong-typed parameter, or a missing/unknown `buy_tokens` argument.
+ * @throws {RangeError} A numeric parameter (including `params.args.*`) that is negative, not an integer,
+ *   above `2^64-1` or a `number` above `2^53-1`, or a byte outside `0..=255`.
  */
 export function fromPlan(plan: AgentPlan): Buffer;
 
@@ -1019,6 +1102,23 @@ export function channelStateMessage(
 export function channelCloseMessage(
   networkDomain: string | BytesInput, channelId: string, generation: U64Input, createdSlot: U64Input,
   partyA: string, partyB: string, finalBalanceA: U64Input, finalBalanceB: U64Input, messageCount: U64Input,
+): Buffer;
+
+/**
+ * The challenge a device key signs for `HardwareAttest` (`hw_attest_challenge`,
+ * `ledger.rs:5299-5319`): `"XRS_HW_ATTEST_V2" ‖ identity(devicePubkey) ‖
+ * identity(boundIdentity) ‖ lp(deviceType) ‖ lp(manufacturer) ‖ lp(model) ‖
+ * lp(firmwareVersion) ‖ u64le(slot)`, with `identity`/`lp` as in
+ * `channelStateMessage`. The node checks the proof against the slot of the
+ * block that includes the transaction (`ledger.rs:7320-7322`) with no
+ * tolerance window, so `slot` must be that block's slot; it cannot be known
+ * in advance, and a proof for another slot is skipped after the fee is
+ * charged. Sign with the device key: `deviceKeypair.sign(challenge)`.
+ * @throws {TypeError|RangeError|EncodingError}
+ */
+export function hardwareAttestChallenge(
+  devicePubkey: string, boundIdentity: string, deviceType: string, manufacturer: string, model: string,
+  firmwareVersion: string, slot: U64Input,
 ): Buffer;
 
 // ---------------------------------------------------------------------------
@@ -1143,9 +1243,9 @@ export interface SubmitResult {
   reward?: number;
   reward_xrs?: number;
   /** lamports */
-  staked?: number;
+  staked?: U64Output;
   /** lamports */
-  unstaked?: number;
+  unstaked?: U64Output;
   unbonding_period_slots?: number;
   pubkey?: string;
   ed25519_pubkey?: string;
@@ -1160,15 +1260,21 @@ export interface SubmitResult {
 export function blockhashFromHex(hex: string): Buffer;
 
 /**
- * Checks encoded instruction data against the node's stateless ingress rules
- * and returns its variant index: a readable `u32le` variant `< INSTRUCTION_COUNT`
- * (`network.rs:183-187`), not a disabled variant, and at most `MAX_IX_DATA_SIZE`
- * bytes (`MAX_SLASH_IX_DATA_SIZE` for variant 38; `network.rs:168-179`,
- * `ledger.rs:93, 119`).
+ * Checks one encoded instruction on its own and returns its variant index: a
+ * readable `u32le` variant `< INSTRUCTION_COUNT` (`network.rs:183-187`), not a
+ * refused variant (22, 48, 49, 52, and 30 whose dispatcher arm is empty,
+ * `ledger.rs:7460-7464`), and at most `MAX_IX_DATA_SIZE` bytes
+ * (`MAX_SLASH_IX_DATA_SIZE` for variant 38; `network.rs:168-179`,
+ * `ledger.rs:93, 119`), and the whole data decodes as
+ * `bincode::deserialize::<XerisInstruction>` does: no truncated field,
+ * `String` valid UTF-8, `Option` tag and `bool` byte 0 or 1, trailing bytes
+ * ignored (`network.rs:180-187`). Field-level rules that need the signer are
+ * applied by `buildTransaction`.
  * @param index Position in the transaction, used only in error messages.
  * @throws {TypeError} When `data` is not a `Buffer`/`Uint8Array`, or `index` is not a non-negative integer.
- * @throws {EncodingError} When `data` is shorter than 4 bytes or the variant is `>= INSTRUCTION_COUNT`.
- * @throws {FeatureDisabledError} For variants 22, 48, 49 and 52.
+ * @throws {EncodingError} When `data` is shorter than 4 bytes, the variant is `>= INSTRUCTION_COUNT`,
+ *   or the fields do not decode.
+ * @throws {FeatureDisabledError} For variants 22, 30, 48, 49 and 52.
  * @throws {RangeError} When `data` exceeds the size cap for its variant.
  */
 export function assertInstructionSubmittable(data: BytesInput, index?: number): number;
@@ -1179,10 +1285,40 @@ export function assertInstructionSubmittable(data: BytesInput, index?: number): 
  * and a zero `programId` (never read by the node, `ledger.rs:8922-8924`;
  * `bin/wallet.rs:181, 519`), `feePayer = payer`, `recentBlockhash = bs58(bytes)`.
  * Instructions execute in order without atomicity (`ledger.rs:5557-5570`).
+ * Before building, applies the node's stateless semantic gate for this payer
+ * (`validate_tx_semantics`, `ledger.rs:1382-1455`): NativeTransfer amount > 0
+ * and canonical, non-`__` destination; TokenMint amount > 0; RWATransfer
+ * amount > 0 and `from != to`; ValidatorAttestation hash of 32 bytes and
+ * `validator === payerPubkey`; the same rules for an AgentExecute /
+ * ConditionalOrder inner instruction and no nesting of those two. It also
+ * refuses payloads the block skips after charging the fee: ContractCall args
+ * that are not a JSON object the node can parse, top-level or inside
+ * AgentExecute / ConditionalOrder (the 16-byte swap payload is exempt except
+ * inside AgentExecute; `ledger.rs:2359-2371, 6436-6442, 9181`), ContractDeploy
+ * `params_json` that is not JSON text of an object (`ledger.rs:6187`), and an
+ * actor field that is not `payerPubkey`: Stake/Unstake `pubkey`,
+ * NativeTransfer / TokenTransfer / TokenBurn / RWATransfer `from`, TokenCreate /
+ * TokenCreateRWA `mint_authority` (`token.rs:1036, 1104, 1151, 1225, 1306`),
+ * CreateIdentity / RegisterModel / AgentHeartbeat `identity_pubkey`,
+ * Register/UpdateCapability `provider_identity`, ClaimTask
+ * `claimant_identity`, PqKeyRotate `ed25519_pubkey`, HardwareAttest
+ * `bound_identity` or, when empty, `device_pubkey` (`ledger.rs:5593-8753`).
+ * For AgentExecute / ConditionalOrder it also refuses an inner instruction
+ * that does not decode (`ledger.rs:6399-6405, 6923-6927`), an AgentExecute
+ * inner variant outside `AGENT_INNER_VARIANTS` (`ledger.rs:6478-6484`), a
+ * `condition_type` outside `CONDITION_TYPES` (`ledger.rs:6916-6921`), a
+ * ConditionalOrder inner instruction above `MAX_CONDITIONAL_INNER_BYTES`
+ * (`ledger.rs:6941-6944`), an AgentExecute inner ContractCall to an
+ * `agent_registry_` contract (`ledger.rs:6428-6431`), an AgentExecute inner TokenTransfer/TokenBurn
+ * whose `from` is not the owner (`ledger.rs:6522, 6648-6655`), and a
+ * ConditionalOrder inner token instruction whose `from` / `mint_authority`
+ * is not `payerPubkey` (`ledger.rs:9270-9272`).
  * @param instructions One encoded instruction or 1..`MAX_IX_PER_TX`; each passes `assertInstructionSubmittable`.
  * @param recentBlockhash 32 raw bytes (from `blockhashFromHex`).
  * @throws {TypeError} Wrong types.
- * @throws {RangeError} Non-canonical payer, 0 or more than 16 instructions, blockhash not 32 bytes, oversize instruction.
+ * @throws {RangeError} Non-canonical payer, 0 or more than 16 instructions, blockhash not 32 bytes, oversize
+ *   instruction, or an instruction the semantic gate rejects (the message quotes the node's error or
+ *   names the block-level check).
  * @throws {EncodingError|FeatureDisabledError} From `assertInstructionSubmittable`.
  */
 export function buildTransaction(payerPubkey: string, instructions: BytesInput | readonly BytesInput[], recentBlockhash: BytesInput): Transaction;
@@ -1274,7 +1410,7 @@ export interface Paginated<T> {
 export interface CursorOptions {
   /** Key of the last row of the previous page (`next_after`). */
   after?: string;
-  /** Rows per page; the node clamps to `1..=REGISTRY_PAGE_ITEMS`. */
+  /** Rows per page, `1..=REGISTRY_PAGE_ITEMS` (32); values outside throw `RangeError` (the node would clamp them). */
   limit?: number;
 }
 
@@ -1299,7 +1435,7 @@ export interface NetworkStats {
   total_transactions: number;
   total_accounts: number;
   /** lamports */
-  total_staked: number;
+  total_staked: U64Output;
   validator_count: number;
   tps_estimate: number;
 }
@@ -1337,7 +1473,7 @@ export interface TransactionSummary {
   from: string;
   to: string;
   /** lamports or token base units, per `tx_type` */
-  amount: number;
+  amount: U64Output;
   amount_xrs: number;
   status: TxStatus;
   /** Instruction kind; account history prefixes it with `sent:` / `received:`. */
@@ -1362,7 +1498,7 @@ export interface TxDetail {
   poh_timestamp: number;
   from: string;
   to: string;
-  amount: number;
+  amount: U64Output;
   amount_xrs: number;
   tx_type: string;
   details: Record<string, unknown> | null;
@@ -1378,10 +1514,10 @@ export interface TxDetail {
 export interface AccountInfo {
   address: string;
   /** lamports */
-  balance: number;
+  balance: U64Output;
   balance_xrs: number;
   /** lamports */
-  stake: number;
+  stake: U64Output;
   is_validator: boolean;
   blocks_proposed: number;
 }
@@ -1391,11 +1527,20 @@ export interface AccountTransactions extends Paginated<TransactionSummary> {
   cursor: number | null;
 }
 
-/** Query of `XerisClient.getAccountTransactions`; `page` is capped at `ACCOUNT_HISTORY_MAX_PAGE`, `pageSize` at `ACCOUNT_HISTORY_MAX_PAGE_SIZE`. */
+/**
+ * Query of `XerisClient.getAccountTransactions`. `page` must be
+ * `1..=ACCOUNT_HISTORY_MAX_PAGE` (50) and `pageSize` `1..=ACCOUNT_HISTORY_MAX_PAGE_SIZE`
+ * (200); values outside throw `RangeError` (the node would clamp them,
+ * `explorer.rs:1305-1307`). Past page 50, page with `before`. `page` and
+ * `before` together throw `RangeError`, because the node ignores `page` when
+ * `before` is present (`explorer.rs:1321-1322`). Unknown keys throw.
+ */
 export interface AccountTransactionsOptions {
+  /** Default 1. */
   page?: number;
+  /** Default 20. */
   pageSize?: number;
-  /** `cursor` of the previous response. */
+  /** `cursor` of the previous response; cannot be combined with `page`. */
   before?: number;
 }
 
@@ -1403,7 +1548,7 @@ export interface AccountTransactionsOptions {
 export interface ValidatorInfo {
   address: string;
   /** lamports */
-  stake: number;
+  stake: U64Output;
   stake_percentage: number;
   blocks_proposed: number;
 }
@@ -1413,7 +1558,7 @@ export interface ValidatorsResponse {
   success: true;
   data: ValidatorInfo[];
   /** lamports */
-  total_staked: number;
+  total_staked: U64Output;
   total_staked_xrs: number;
   validator_count: number;
 }
@@ -1437,7 +1582,7 @@ export interface RwaMetadata {
   transfer_restricted: boolean;
   accredited_only: boolean;
   /** USD cents */
-  valuation: number;
+  valuation: U64Output;
   approved_holders: string[];
   /** `[slot, old_status, new_status]`; `GET /v2/tokens` truncates to 256 entries and adds `status_history_total`. */
   status_history: Array<[number, string, string]>;
@@ -1451,9 +1596,9 @@ export interface TokenInfo {
   symbol: string;
   decimals: number;
   /** base units */
-  max_supply: number;
+  max_supply: U64Output;
   /** base units */
-  current_supply: number;
+  current_supply: U64Output;
   mint_authority: string;
   created_slot: number;
   rwa_metadata: RwaMetadata | null;
@@ -1465,7 +1610,7 @@ export interface TokenBalance {
   address: string;
   token_id: string;
   /** base units */
-  balance: number;
+  balance: U64Output;
   token_info: TokenInfo | null;
 }
 
@@ -1474,7 +1619,7 @@ export interface TokenAccount {
   token_id: string;
   symbol: string;
   /** base units */
-  balance: number;
+  balance: U64Output;
   balance_display: number;
   decimals: number;
 }
@@ -1483,7 +1628,7 @@ export interface TokenAccount {
 export interface TokenAccounts {
   address: string;
   /** lamports, despite the name */
-  native_xrs: number;
+  native_xrs: U64Output;
   token_accounts: TokenAccount[];
 }
 
@@ -1491,7 +1636,7 @@ export interface TokenAccounts {
 export interface HolderRow {
   address: string;
   /** base units */
-  balance: number;
+  balance: U64Output;
 }
 
 /** `GET /v2/token/{id}/holders` (`explorer.rs:1681-1712`). */
@@ -1509,8 +1654,8 @@ export interface RwaListRow {
   name: string;
   symbol: string;
   decimals: number;
-  max_supply: number;
-  current_supply: number;
+  max_supply: U64Output;
+  current_supply: U64Output;
   /** the token's `mint_authority` */
   issuer: string;
   created_slot: number;
@@ -1519,7 +1664,7 @@ export interface RwaListRow {
   status: string;
   transfer_restricted: boolean;
   accredited_only: boolean;
-  valuation_usd_cents: number;
+  valuation_usd_cents: U64Output;
   legal_doc_hash: string;
   legal_doc_uri: string;
   approved_holder_count: number;
@@ -1564,11 +1709,11 @@ export interface SwapPoolState {
   token_a: string;
   token_b: string;
   /** base units */
-  reserve_a: number;
+  reserve_a: U64Output;
   /** base units */
-  reserve_b: number;
+  reserve_b: U64Output;
   fee_bps: number;
-  total_shares: number;
+  total_shares: U64Output;
   lp_shares: Record<string, number>;
   [field: string]: unknown;
 }
@@ -1606,12 +1751,12 @@ export interface ContractResponse {
 export interface SwapQuote {
   input_token: string;
   /** base units */
-  input_amount: number;
+  input_amount: U64Output;
   output_token: string;
   /** base units */
-  output_amount: number;
+  output_amount: U64Output;
   /** base units of the input token */
-  fee: number;
+  fee: U64Output;
   fee_bps: number;
   /** formatted with two decimals */
   price_impact_pct: string;
@@ -1637,11 +1782,11 @@ export interface VestingStatus {
         enabled: true;
         cliff_ends_at?: number;
         cliff_remaining_seconds?: number;
-        total_purchased: number;
-        total_unlocked?: number;
-        total_sold?: number;
-        available_to_sell: number;
-        max_per_tx?: number;
+        total_purchased: U64Output;
+        total_unlocked?: U64Output;
+        total_sold?: U64Output;
+        available_to_sell: U64Output;
+        max_per_tx?: U64Output;
         daily_unlock_pct?: number;
         max_sell_pct?: number;
         fully_vested_at?: number;
@@ -1657,23 +1802,24 @@ export interface LaunchpadInfo {
   image_url: string;
   description: string;
   creator: string;
-  total_supply: number;
-  tokens_sold: number;
-  tokens_remaining: number;
+  total_supply: U64Output;
+  tokens_sold: U64Output;
+  tokens_remaining: U64Output;
   /** lamports */
-  xrs_collected: number;
+  xrs_collected: U64Output;
   /** lamports */
-  target_liquidity_xrs: number;
-  current_price_lamports: number;
-  market_cap_xrs_lamports: number;
+  target_liquidity_xrs: U64Output;
+  current_price_lamports: U64Output;
+  market_cap_xrs_lamports: U64Output;
   progress_pct: number;
   creator_reward_bps: number;
   xeris_fee_bps: 77;
   total_fee_bps: number;
-  creator_rewards_accrued: number;
-  xeris_fees_accrued: number;
+  creator_rewards_accrued: U64Output;
+  xeris_fees_accrued: U64Output;
   finalized: boolean;
-  dex_pool_id: string;
+  /** `null` until the curve finalizes and the DEX pool exists (`contracts.rs:554, 1700`). */
+  dex_pool_id: string | null;
   created_slot: number;
   trade_count: number;
 }
@@ -1686,15 +1832,15 @@ export interface LaunchpadsResponse {
 /** `GET /launchpad/{id}/quote?xrs_amount=` (`network.rs:5274-5327`). */
 export interface LaunchpadQuote {
   /** lamports */
-  xrs_amount: number;
+  xrs_amount: U64Output;
   /** base units */
-  tokens_out: number;
+  tokens_out: U64Output;
   /** lamports */
-  creator_fee: number;
+  creator_fee: U64Output;
   /** lamports */
-  xeris_fee: number;
+  xeris_fee: U64Output;
   /** lamports */
-  total_fees: number;
+  total_fees: U64Output;
   effective_price: number;
   price_after: number;
   price_impact_pct: number;
@@ -1706,9 +1852,9 @@ export interface AgentEntry {
   agent_name: string;
   owner: string;
   /** lamports */
-  max_per_tx: number;
+  max_per_tx: U64Output;
   /** lamports per `AGENT_DAILY_WINDOW_SLOTS` */
-  max_daily: number;
+  max_daily: U64Output;
   /** empty = all */
   allowed_contracts: string[];
   /** empty = all; entries are `AgentOperation` strings */
@@ -1717,10 +1863,10 @@ export interface AgentEntry {
   expires_at_slot: number;
   revoked: boolean;
   created_slot: number;
-  daily_spent: number;
+  daily_spent: U64Output;
   daily_window_start: number;
   total_txs: number;
-  total_spent: number;
+  total_spent: U64Output;
 }
 
 /** `GET /agent/registry/{owner}` (`network.rs:5332-5355`); an owner without a registry gets `agent_count: 0`. */
@@ -1752,11 +1898,11 @@ export interface TransferPlan {
   action: 'transfer';
   variant_index: 11;
   variant_name: 'NativeTransfer';
-  params: { from: string; to: string; amount: number };
+  params: { from: string; to: string; amount: U64Output };
   amount_xrs: number;
   fee: number;
   fee_xrs: number;
-  sender_balance: number;
+  sender_balance: U64Output;
   sufficient_balance: boolean;
 }
 
@@ -1766,8 +1912,8 @@ export interface SwapPlan {
   variant_index: 4;
   variant_name: 'ContractCall';
   params: { contract_id: string; method: SwapMethod; args: number[] };
-  quote: { amount_out: number; min_amount_out: number; fee: number; slippage_pct: number; price_impact_pct: number };
-  pool: { token_a: string; token_b: string; reserve_a: number; reserve_b: number };
+  quote: { amount_out: U64Output; min_amount_out: U64Output; fee: U64Output; slippage_pct: number; price_impact_pct: number };
+  pool: { token_a: string; token_b: string; reserve_a: U64Output; reserve_b: U64Output };
 }
 
 /** `POST /agent/plan` for `buy_launchpad` (`network.rs:5498-5534`). */
@@ -1775,8 +1921,8 @@ export interface BuyLaunchpadPlan {
   action: 'buy_launchpad';
   variant_index: 4;
   variant_name: 'ContractCall';
-  params: { contract_id: string; method: 'buy_tokens'; args: { xrs_amount: number; min_tokens_out: number } };
-  quote: { tokens_out: number; min_tokens_out: number; creator_fee: number; xeris_fee: number; slippage_pct: number };
+  params: { contract_id: string; method: 'buy_tokens'; args: { xrs_amount: U64Output; min_tokens_out: U64Output } };
+  quote: { tokens_out: U64Output; min_tokens_out: U64Output; creator_fee: U64Output; xeris_fee: U64Output; slippage_pct: number };
 }
 
 /** `POST /agent/plan` for `stake` (`network.rs:5535-5545`). */
@@ -1784,7 +1930,7 @@ export interface StakePlan {
   action: 'stake';
   variant_index: 9;
   variant_name: 'Stake';
-  params: { pubkey: string; amount: number };
+  params: { pubkey: string; amount: U64Output };
   amount_xrs: number;
   min_stake_xrs: number;
 }
@@ -1794,7 +1940,7 @@ export interface WrapPlan {
   action: 'wrap';
   variant_index: 13;
   variant_name: 'WrapXrs';
-  params: { amount: number };
+  params: { amount: U64Output };
   amount_xrs: number;
 }
 
@@ -1803,7 +1949,7 @@ export interface UnwrapPlan {
   action: 'unwrap';
   variant_index: 14;
   variant_name: 'UnwrapXrs';
-  params: { amount: number };
+  params: { amount: U64Output };
   amount_xrs: number;
 }
 
@@ -1818,7 +1964,7 @@ export interface CapabilityListing {
   region: string;
   description: string;
   /** lamports */
-  price_per_unit: number;
+  price_per_unit: U64Output;
   max_concurrent: number;
   current_tasks: number;
   metadata_json: string;
@@ -1827,13 +1973,18 @@ export interface CapabilityListing {
   reputation_snapshot: number;
 }
 
-/** Query of `GET /capabilities/search` (`network.rs:5583-5615`); `tags` are joined with `,`. */
+/**
+ * Query of `GET /capabilities/search` (`network.rs:5583-5615`). Keys are
+ * camelCase; the node's names (`min_rep`, `max_price`) and any other unknown
+ * key throw `RangeError`. `tags` are joined with `,`; a tag that is empty,
+ * contains `,` or has surrounding whitespace throws (`network.rs:5593-5594`).
+ */
 export interface CapabilitySearchParams {
   category?: string;
   tags?: readonly string[];
   /** listings with `region === 'global'` always match */
   region?: string;
-  minRep?: number;
+  minRep?: U64Input;
   /** lamports; listings priced `0` always match */
   maxPrice?: U64Input;
   /** node default 50 */
@@ -1866,14 +2017,14 @@ export interface TaskEntry {
   required_tags: string[];
   min_reputation: number;
   /** lamports, immutable display value */
-  reward: number;
+  reward: U64Output;
   /** lamports still escrowed */
-  escrow_remaining: number;
+  escrow_remaining: U64Output;
   expires_at_slot: number;
   max_claimants: number;
   verification: string;
   verification_oracle: string;
-  verification_threshold: number;
+  verification_threshold: U64Output;
   created_slot: number;
   claimants: string[];
   status: TaskStatus;
@@ -1955,9 +2106,9 @@ export interface GovernanceProposal {
   proposer: string;
   status: 'Active' | 'Passed' | 'Failed' | 'Executed';
   /** lamports of voting weight */
-  votes_for: number;
-  votes_against: number;
-  quorum: number;
+  votes_for: U64Output;
+  votes_against: U64Output;
+  quorum: U64Output;
   /** `voting_end_slot * 4000` */
   expiry_timestamp: number;
   action: { type: string; params: Record<string, never> };
@@ -1976,7 +2127,7 @@ export interface GovernanceProposals {
 export interface GovernanceLock {
   address: string;
   /** lamports */
-  locked_amount: number;
+  locked_amount: U64Output;
   locked_xrs: number;
   delegate: string | null;
 }
@@ -1989,7 +2140,7 @@ export interface PriceSnapshot {
   tvl: number;
   token_a: string;
   token_b: string;
-  total_fees_lamports: number;
+  total_fees_lamports: U64Output;
 }
 
 /** `GET /price-history?pool_id=&limit=` (`network.rs:6026-6075`). */
@@ -2010,10 +2161,10 @@ export interface PoolRow {
   pool_id: string;
   token_a: string;
   token_b: string;
-  reserve_a: number;
-  reserve_b: number;
+  reserve_a: U64Output;
+  reserve_b: U64Output;
   fee_bps: number;
-  total_lp_shares: number;
+  total_lp_shares: U64Output;
   lp_holder_count: number;
   /** formatted with eight decimals */
   price_a_in_b: string;
@@ -2029,7 +2180,7 @@ export interface PoolRow {
 export interface StakeInfo {
   address: string;
   /** lamports */
-  stake: number;
+  stake: U64Output;
   stake_xrs: number;
   isValidator: boolean;
   blocksProposed: number;
@@ -2045,7 +2196,7 @@ export interface StakeInfo {
 export interface UnstakingSession {
   id: string;
   /** lamports */
-  amount: number;
+  amount: U64Output;
   start_time: number;
   end_time: number;
   start_slot: number;
@@ -2061,7 +2212,7 @@ export interface UnstakingInfo {
 
 /** `GET /network/economics` (`network.rs:5147-5183`). */
 export interface NetworkEconomics {
-  total_mined_lamports: number;
+  total_mined_lamports: U64Output;
   total_mined_xrs: number;
   emission_cap_xrs: number;
   remaining_emission_xrs: number;
@@ -2073,12 +2224,12 @@ export interface NetworkEconomics {
   fees_active: boolean;
   base_tx_fee_lamports: number;
   base_tx_fee_xrs: number;
-  total_fees_collected_lamports: number;
+  total_fees_collected_lamports: U64Output;
   total_fees_collected_xrs: number;
   chain_height: number;
   staking_apy_pct: number;
   staking_reward_interval_blocks: number;
-  total_staked_lamports: number;
+  total_staked_lamports: U64Output;
   total_staked_xrs: number;
   num_eligible_stakers: number;
   min_stake_for_rewards_xrs: number;
@@ -2092,7 +2243,8 @@ export interface LedgerBlock {
   /** serde form of `solana_sdk::transaction::Transaction` */
   transactions: unknown[];
   merkle_root: number[];
-  proposer: string;
+  /** 32 raw bytes of the proposer's `Pubkey` (serde newtype of `[u8; 32]`, `ledger.rs:300`); base58-encode to display. */
+  proposer: number[];
   /** milliseconds */
   poh_timestamp: number;
   previous_hash: number[];
@@ -2154,7 +2306,7 @@ export type HeartbeatRegistryPage = RegistryPage<HeartbeatRecord, 'heartbeats'> 
 /** `GET /v2/contract/{id}` (`explorer.rs:1843-1967`): a registry page for the four paged registries, else `{success, contract}`. */
 export type ContractV2Response = ModelRegistryPage | CapabilityRegistryPage | DeviceRegistryPage | HeartbeatRegistryPage | ContractResponse;
 
-/** Query of `XerisClient.getContractV2`; `pageSize` is clamped to `1..=REGISTRY_PAGE_ITEMS` by the node. */
+/** Query of `XerisClient.getContractV2`; `pageSize` must be `1..=REGISTRY_PAGE_ITEMS` (the node would clamp it); unknown keys throw. */
 export interface RegistryPageOptions {
   page?: number;
   pageSize?: number;
@@ -2164,10 +2316,10 @@ export interface RegistryPageOptions {
 export interface RpcAccountInfo {
   context: { slot: number };
   value: {
-    lamports: number;
+    lamports: U64Output;
     owner: 'system';
     executable: false;
-    stake: number;
+    stake: U64Output;
     isValidator: boolean;
   };
 }
@@ -2203,7 +2355,7 @@ export interface RpcTransaction {
     signatures: string[];
     from: string;
     to: string;
-    amount: number;
+    amount: U64Output;
     amount_xrs: number;
     tx_type: string;
     details: Record<string, unknown> | null;
@@ -2219,7 +2371,7 @@ export interface SignatureInfo {
   err: RpcTxError;
   from: string;
   to: string;
-  amount: number;
+  amount: U64Output;
   amount_xrs: number;
   tx_type: string;
   type: 'sent' | 'received';
@@ -2269,6 +2421,17 @@ export interface DAppOptions extends ClientOptions {
   provider?: XerisWalletProvider;
   /** Node base URL with scheme, e.g. `'http://138.197.116.81'`. */
   host?: string;
+  /**
+   * Given alone, a bare `scheme://host:56001` also fixes the explorer
+   * (`host:50008`), and a bare `scheme://host:50008` `explorerUrl` fixes the
+   * RPC URL. Any other URL is used unchanged and the missing one is resolved
+   * at `connect()` from the other option, `provider.getRpcUrl()` /
+   * `provider.getExplorerUrl()`, or the testnet seed for the RPC URL; it is
+   * never guessed from a non-default URL (`XerisError` `code 'config'`).
+   */
+  rpcUrl?: string;
+  /** See `rpcUrl`. */
+  explorerUrl?: string;
   /**
    * Fixed SDK default `'testnet'`: when no host can be resolved, testnet falls
    * back to `http://TESTNET_SEED`; `'mainnet'` has no built-in host
@@ -2343,13 +2506,21 @@ export interface Checks {
   /** `minReputation === 0`, verification in `TASK_VERIFICATION_MODES` (`'oracle'` needs a non-empty oracle), title <= 256 B, description <= 4096 B, `reward > 0` (`contracts.rs:4698-4700, 4723-4760`). */
   taskPost(minReputation: U8Input, verification: string, verificationOracle: string, title: string, description: string, reward: U64Input): void;
   /**
-   * `AgentExecute` inner-instruction allow-list (`ledger.rs:6425-6485, 2138-2175`):
-   * variant in `AGENT_INNER_VARIANTS` (else `RangeError`); 9/10 throw
-   * `FeatureDisabledError` (`agentStake`); a `ContractCall` needs JSON-object
-   * args (a swap payload → `agentSwap`), a method in `DELEGATED_CALL_METHODS`
-   * (else `agentDelegatedMethod`) and a `contractId` not starting with `agent_registry_`.
+   * `AgentExecute` inner-instruction rules (`ledger.rs:6399-6485, 2138-2175`):
+   * the bytes decode as a `XerisInstruction` (strict bincode: no truncation,
+   * valid UTF-8, `Option`/`bool` bytes 0 or 1; else `EncodingError`,
+   * `ledger.rs:6399-6405`); variant in `AGENT_INNER_VARIANTS` and not 17/23
+   * (else `RangeError`); 9/10 throw `FeatureDisabledError` (`agentStake`); a
+   * TokenTransfer/TokenBurn `from` equal to `ownerPubkey`, as the block runs
+   * it as the owner (else `RangeError`, `ledger.rs:6522, 6648-6655`;
+   * `token.rs:1104, 1151`); a `ContractCall` needs args that serde_json
+   * parses as an object (`ledger.rs:6436-6442`; no lone surrogate, no
+   * out-of-range number; else `XerisError`, a swap payload → `agentSwap`), a
+   * method in `DELEGATED_CALL_METHODS` (else `agentDelegatedMethod`) and a
+   * `contractId` not starting with `agent_registry_`.
+   * @param ownerPubkey The AgentExecute `owner_pubkey` the inner instruction runs as.
    */
-  agentInner(innerData: BytesInput): void;
+  agentInner(innerData: BytesInput, ownerPubkey: string): void;
   /** Every entry in `AGENT_OPERATIONS` (`contracts.rs:3471-3477`). */
   agentOperations(list: readonly string[]): void;
 }
@@ -2404,14 +2575,30 @@ export class XerisClient {
   getLatestBlockhash(): Promise<Buffer>;
   /**
    * `assertInstructionSubmittable` each → `getLatestBlockhash` → `assembleSignedTransaction` → `POST {route}` → `parseSubmitResponse`.
+   *
+   * When the request was sent but no usable answer came back (`code`
+   * `timeout`, `rpc_transport`, `rpc_http`, `rpc_json`), the node may hold the
+   * transaction; the error carries `signature` and `txBase64`. Do not call
+   * `sendInstruction` again (it signs a new transaction with a new signature,
+   * which the node's duplicate check does not catch): poll
+   * `waitForConfirmation(err.signature)` or resend `err.txBase64` with
+   * `submitSignedTransaction`.
    * @param instructionData One encoded instruction or 1..`MAX_IX_PER_TX`.
    * @throws {TypeError} When `keypair` is not a `XerisKeypair`.
-   * @throws {RangeError} For a route outside `WriteRoute` or a bad instruction count.
+   * @throws {RangeError} For a route outside `WriteRoute`, an unknown `opts` key, a bad instruction count, or an
+   *   instruction the node's semantic gate rejects (see `buildTransaction`).
    * @throws {EncodingError|FeatureDisabledError} From `assertInstructionSubmittable`.
-   * @throws {RpcError|XerisError} Node error bodies, transport failures, timeouts.
+   * @throws {RpcError|XerisError} Node error bodies (code `duplicate` when the node already holds the
+   *   signature), transport failures, timeouts.
    */
   sendInstruction(keypair: XerisKeypair, instructionData: BytesInput | readonly BytesInput[], opts?: SendOptions): Promise<SubmitResult>;
-  /** POSTs pre-signed transaction bytes (`{tx_base64}`) to `route` (default `'/submit'`) and parses the body. */
+  /**
+   * POSTs pre-signed transaction bytes (`{tx_base64}`) to `route` (default
+   * `'/submit'`) and parses the body. Resending identical bytes is safe: a
+   * copy the node already holds is answered with `RpcError` code `duplicate`.
+   * Errors after sending carry `signature` / `txBase64` as in `sendInstruction`.
+   * @throws {EncodingError} Not padded base64, or not a single-signature transaction.
+   */
   submitSignedTransaction(txBase64: string, route?: WriteRoute): Promise<SubmitResult>;
   /**
    * Polls `getTransaction(signature)` every `intervalMs` until the explorer
@@ -2470,9 +2657,9 @@ export class XerisClient {
   rwaUpdateStatus(keypair: XerisKeypair, tokenId: string, newStatus: RwaStatus, newValuation: Optional<U64Input>, newLegalDocHash: Optional<string>, newLegalDocUri: Optional<string>): Promise<SubmitResult>;
   /** RWATransfer from the signer. Preflight: `positive`, `to !== signer`. */
   rwaTransfer(keypair: XerisKeypair, tokenId: string, to: string, amount: U64Input): Promise<SubmitResult>;
-  /** ContractDeploy with `JSON.stringify(params)`. Preflight: `contractId`, `contractType` (a `ContractTypeAlias`, case-insensitive). */
+  /** ContractDeploy with `stringifyJson(params)` (`bigint` written exactly). Preflight: `contractId`, `contractType` (a `ContractTypeAlias`, case-insensitive). */
   deployContract(keypair: XerisKeypair, contractId: string, contractType: string, params: Record<string, unknown>): Promise<SubmitResult>;
-  /** ContractCall. `args` is a plain object, or exactly 16 raw bytes for the two swap methods. */
+  /** ContractCall. `args` is a plain object (written with `stringifyJson`; `bigint` exact), or exactly 16 raw bytes for the two swap methods. */
   callContract(keypair: XerisKeypair, contractId: string, method: string, args: Record<string, unknown> | BytesInput): Promise<SubmitResult>;
   /** AMM swap via `encodeSwapCall`. Preflight: `swapMethod`, `positive(inputAmount)`, `positive(minOutput)` (`contracts.rs:2419-2432`). */
   swap(keypair: XerisKeypair, poolId: string, method: SwapMethod, inputAmount: U64Input, minOutput: U64Input): Promise<SubmitResult>;
@@ -2515,8 +2702,11 @@ export class XerisClient {
   sendAgentMessage(keypair: XerisKeypair, toIdentity: string, messageType: MessageType, payloadJson: string, replyTo: string, expiresAtSlot: U64Input): Promise<SubmitResult>;
   /**
    * ConditionalOrder. Preflight: `oneOf(conditionType, CONDITION_TYPES)`,
-   * `innerInstruction.length <= MAX_CONDITIONAL_INNER_BYTES`, `lockedAmount >= ORDER_STORAGE_BOND`,
-   * `assertInstructionSubmittable(inner)` and inner variant not 17/23 (`ledger.rs:1439`).
+   * `innerInstruction.length <= MAX_CONDITIONAL_INNER_BYTES` (`ledger.rs:6941-6944`),
+   * the inner bytes decode as a `XerisInstruction` (else `EncodingError`, `ledger.rs:6923-6927`),
+   * `lockedAmount >= ORDER_STORAGE_BOND`, `assertInstructionSubmittable(inner)` and inner
+   * variant not 17/23 (`ledger.rs:1439`). `buildTransaction` also requires an inner token
+   * instruction's `from` / `mint_authority` to be the signer, who owns the order.
    */
   conditionalOrder(
     keypair: XerisKeypair, orderId: string, conditionType: ConditionType, conditionSource: string, conditionThreshold: U64Input,
@@ -2528,7 +2718,12 @@ export class XerisClient {
   registerOracle(keypair: XerisKeypair, oracleId: string, description: string, feedType: FeedType, updateIntervalSlots: U64Input, stakeAmount: U64Input): Promise<SubmitResult>;
   /** OracleSubmit. Preflight: `maxBytes(metadata, 1024)`. */
   oracleSubmit(keypair: XerisKeypair, oracleId: string, value: U64Input, metadata: string): Promise<SubmitResult>;
-  /** HardwareAttest. Preflight: `oneOf(deviceType, DEVICE_TYPES)`, `ed25519Signature(attestationProof)`. */
+  /**
+   * HardwareAttest. Preflight: `oneOf(deviceType, DEVICE_TYPES)`, `ed25519Signature(attestationProof)`.
+   * `attestationProof` must sign `hardwareAttestChallenge(...)` for the slot of the block that includes
+   * the transaction (`ledger.rs:7320-7322`), which is not known in advance; a proof for another slot is
+   * skipped by the node after the fee is charged, so expect to retry with a proof for a later slot.
+   */
   hardwareAttest(
     keypair: XerisKeypair, devicePubkey: string, deviceType: DeviceType, manufacturer: string, model: string,
     firmwareVersion: string, attestationProof: BytesInput, boundIdentity: string,
@@ -2631,10 +2826,14 @@ export class XerisClient {
   governanceDelegate(...args: unknown[]): never;
 
   // -- Read methods, RPC port (blueprint §10.6) ----------------------------
+  // Path parameters (`{address}`, `{tokenId}`, `{id}`, ...) are sent
+  // unencoded. The node's router does not percent-decode them (warp 0.3.7
+  // `path::param`), so a value that is empty, `.` / `..`, or contains a
+  // character outside RFC 3986 `pchar` (or `%`) throws `RangeError`.
 
   /** `GET /health` (`network.rs:4860-4862`). */
   getHealth(): Promise<{ status: 'ok' }>;
-  /** `GET /blocks` (`network.rs:4555-4559`): up to 50 raw blocks, newest first. */
+  /** `GET /blocks` (`network.rs:4555-4559`): up to 50 raw blocks, newest first; hashes and `proposer` are byte arrays. */
   getRecentBlocks(): Promise<LedgerBlock[]>;
   /** `GET /stake/{address}` (`network.rs:4866-4899`). */
   getStakeInfo(address: string): Promise<StakeInfo>;
@@ -2668,9 +2867,15 @@ export class XerisClient {
   agentPlan(body: AgentPlanRequest): Promise<AgentPlan>;
   /** `agentPlan({action:'transfer', from, to, amount_xrs})`. `amountXrs` is a JSON number parsed as `f64` and truncated to lamports (`network.rs:5398-5399`). */
   planTransfer(from: string, to: string, amountXrs: number): Promise<TransferPlan>;
-  /** `agentPlan({action:'swap', pool_id, token_in, amount_in, slippage_pct})`; `amountIn` in base units, `slippagePct` in `0..=100`. */
+  /**
+   * `agentPlan({action:'swap', pool_id, token_in, amount_in, slippage_pct})`; `amountIn` in base units,
+   * `slippagePct` in `0..=100`, required and always sent (the node would default to 5, `network.rs:5421`).
+   */
   planSwap(poolId: string, tokenIn: string, amountIn: U64Input, slippagePct: number): Promise<SwapPlan>;
-  /** `agentPlan({action:'buy_launchpad', launchpad_id, xrs_amount, slippage_pct})`; `xrsAmount` in lamports. */
+  /**
+   * `agentPlan({action:'buy_launchpad', launchpad_id, xrs_amount, slippage_pct})`; `xrsAmount` in lamports,
+   * `slippagePct` required (the node would default to 5, `network.rs:5485`).
+   */
   planBuyLaunchpad(launchpadId: string, xrsAmount: U64Input, slippagePct: number): Promise<BuyLaunchpadPlan>;
   /** `agentPlan({action:'stake', pubkey, amount_xrs})`; `amountXrs` as `planTransfer`. */
   planStake(pubkey: string, amountXrs: number): Promise<StakePlan>;
@@ -2700,28 +2905,37 @@ export class XerisClient {
   getGovernanceProposals(): Promise<GovernanceProposals>;
   /** `GET /governance/lock/{address}` (`network.rs:5821-5833`). */
   getGovernanceLock(address: string): Promise<GovernanceLock>;
-  /** `GET /price-history?pool_id=&limit=` (`network.rs:6026-6075`); `limit` defaults to the node's own 500 and is capped at 10080 by the node. */
+  /**
+   * `GET /price-history?pool_id=&limit=` (`network.rs:6026-6075`). `limit` defaults to the node's own 500 and must be
+   * `0..=PRICE_HISTORY_MAX_LIMIT` (the node would cap it, `network.rs:6030-6033`); `poolId` must match
+   * `CONTRACT_ID_PATTERN` (the node strips other characters and would read another pool's file, `network.rs:6036-6039`).
+   * Both throw `RangeError`.
+   */
   getPriceHistory(poolId: string, limit?: number): Promise<PriceHistory>;
   /** `GET /pools/price-history` (`network.rs:6079-6106`). */
   getAllPoolPriceHistory(): Promise<AllPoolPriceHistory>;
 
   // -- Read methods, explorer port (blueprint §10.7) -----------------------
+  // Path parameters follow the same rule as on the RPC port (see above).
 
   /** `GET /v2/stats` (`explorer.rs:965-1011`). */
   getStats(): Promise<ApiResponse<NetworkStats>>;
-  /** `GET /v2/blocks?page=&page_size=` (`explorer.rs:1014-1034`); defaults 1 / 20, `page_size` capped at 100 by the node. */
+  /** `GET /v2/blocks?page=&page_size=` (`explorer.rs:1014-1034`); defaults 1 / 20. `pageSize` outside `1..=LIST_MAX_PAGE_SIZE` throws `RangeError` (the node would clamp it, `explorer.rs:280, 1020`). */
   getBlocks(page?: number, pageSize?: number): Promise<Paginated<BlockSummary>>;
   /** `GET /v2/block/slot/{slot}` (`explorer.rs:1037-1081`); reaches disk for old slots. */
   getBlockBySlot(slot: U64Input): Promise<ApiResponse<BlockDetail>>;
   /** `GET /v2/block/hash/{hash}` (`explorer.rs:1084-1106`); in-memory blocks only. */
   getBlockByHash(hashHex: string): Promise<ApiResponse<BlockDetail>>;
-  /** `GET /v2/transactions?page=&page_size=` (`explorer.rs:1109-1180`). */
+  /** `GET /v2/transactions?page=&page_size=` (`explorer.rs:1109-1180`); defaults 1 / 20. `pageSize` outside `1..=LIST_MAX_PAGE_SIZE` throws `RangeError` (the node would clamp it, `explorer.rs:1114, 1125`). */
   getTransactions(page?: number, pageSize?: number): Promise<Paginated<TransactionSummary>>;
   /** `GET /v2/tx/{signature}` (`explorer.rs:1183-1249`); not found → `RpcError('Transaction not found')`. */
   getTransaction(signature: string): Promise<ApiResponse<TxDetail>>;
   /** `GET /v2/account/{address}` (`explorer.rs:1251-1284`). */
   getAccountInfo(address: string): Promise<ApiResponse<AccountInfo>>;
-  /** `GET /v2/account/{address}/transactions?page=&page_size=&before=` (`explorer.rs:1287-1375`). */
+  /**
+   * `GET /v2/account/{address}/transactions?page=&page_size=&before=` (`explorer.rs:1287-1375`).
+   * 4.x took `(address, page, pageSize)`; a non-object `opts` throws `TypeError`.
+   */
   getAccountTransactions(address: string, opts?: AccountTransactionsOptions): Promise<AccountTransactions>;
   /** `GET /v2/validators` (`explorer.rs:1377-1410`). */
   getValidators(): Promise<ValidatorsResponse>;
@@ -2744,8 +2958,11 @@ export class XerisClient {
 
   // -- JSON-RPC methods, explorer port `POST /` (blueprint §10.8) ----------
 
-  /** JSON-RPC `getBalance` → `result.value` lamports; unknown addresses read 0 (`explorer.rs:1448-1458`). */
-  getBalance(address: string): Promise<number>;
+  /**
+   * JSON-RPC `getBalance` → `result.value` lamports; unknown addresses read 0 (`explorer.rs:1448-1458`).
+   * A `bigint` above `2^53-1` lamports (exact), a `number` otherwise.
+   */
+  getBalance(address: string): Promise<U64Output>;
   /** JSON-RPC `getAccountInfo` (`explorer.rs:1460-1481`). */
   getAccountInfoRpc(address: string): Promise<RpcAccountInfo>;
   /** JSON-RPC `getSlot` (`explorer.rs:1483`). */
@@ -2756,7 +2973,7 @@ export class XerisClient {
   getBlockRpc(slot: U64Input): Promise<RpcBlock | null>;
   /** JSON-RPC `getTransaction` (`explorer.rs:1519-1536, 1572-1600`); `null` when not found. */
   getTransactionRpc(signature: string): Promise<RpcTransaction | null>;
-  /** JSON-RPC `getSignaturesForAddress` (`explorer.rs:1538-1556, 1604-1630`); `limit` defaults to the node's 20 and is capped at 200 by the node. */
+  /** JSON-RPC `getSignaturesForAddress` (`explorer.rs:1538-1556, 1604-1630`); `limit` defaults to the node's 20; outside `1..=SIGNATURES_MAX_LIMIT` it throws `RangeError` (the store would clamp it, `tx_store.rs:57, 351`). */
   getSignaturesForAddress(address: string, limit?: number): Promise<SignatureInfo[]>;
   /** JSON-RPC `getHealth` (`explorer.rs:1558`). */
   getHealthRpc(): Promise<'ok'>;
@@ -2784,8 +3001,14 @@ export interface XerisWalletProvider {
   signAndSendTransaction?(tx: Transaction): Promise<{ signature: string }>;
   signMessage?(message: Uint8Array): Promise<{ signature: Uint8Array }>;
   disconnect?(): Promise<void>;
-  /** Node RPC URL; `:56001` is stripped to derive the host. */
+  /**
+   * Node RPC URL. `scheme://host:56001` (no path) names the node host and the
+   * explorer is taken as `host:50008`; any other URL is used unchanged and
+   * the explorer URL must come from `getExplorerUrl()` or `opts.explorerUrl`.
+   */
   getRpcUrl?(): Promise<string>;
+  /** Explorer base URL, consulted when `getRpcUrl()` does not name a bare `host:56001`. */
+  getExplorerUrl?(): Promise<string>;
   on?(event: 'disconnect' | 'accountChanged', handler: (arg: unknown) => void): void;
   off?(event: string, handler: (...args: unknown[]) => void): void;
 }
@@ -2803,7 +3026,11 @@ export type DAppEvent = 'connect' | 'disconnect' | 'accountChanged';
 export class XerisDApp {
   /** @throws {TypeError|RangeError|XerisError} On malformed options. */
   constructor(opts?: DAppOptions);
-  /** `window.xeris`, else `window.solana` when it has `isXeris`, else `window.solana`, else `null`. */
+  /**
+   * `window.xeris`, else `window.solana` when it sets `isXeris === true`, else
+   * `null`. A `window.solana` without `isXeris` is not used (pass it as
+   * `opts.provider` if intended).
+   */
   static detectProvider(): XerisWalletProvider | null;
   /**
    * Polls `detectProvider()` every 100 ms until a provider appears or `timeoutMs`
@@ -2822,8 +3049,11 @@ export class XerisDApp {
    * Resolves the provider (`opts.provider` → `detectProvider()` → `waitForProvider(2000)`),
    * connects, validates the public key, resolves the node base URL
    * (`opts.rpcUrl`/`explorerUrl` → `opts.host` → `provider.getRpcUrl()` → testnet seed)
-   * and creates the internal client.
-   * @throws {XerisError} `code 'provider'` (no provider, `connect` missing/rejected, no usable key); `code 'config'` for mainnet without a host.
+   * and creates the internal client. A `getRpcUrl()` result other than a bare
+   * `scheme://host:56001` is used unchanged and needs an explorer URL from
+   * `opts.explorerUrl` or `provider.getExplorerUrl()`.
+   * @throws {XerisError} `code 'provider'` (no provider, `connect` missing/rejected, no usable key); `code 'config'`
+   *   for mainnet without a host, or a non-default RPC URL with no explorer URL.
    * @throws {RangeError} When the wallet's key is not canonical.
    */
   connect(opts?: { onlyIfTrusted?: boolean }): Promise<{ publicKey: string }>;
@@ -2877,13 +3107,13 @@ export class XerisDApp {
   removeLiquidity(poolId: string, shares: U64Input, minAmountA: U64Input, minAmountB: U64Input): Promise<SubmitResult>;
   /** ContractCall; `args` is a plain object, or 16 raw bytes for the swap methods. */
   callContract(contractId: string, method: string, args: Record<string, unknown> | BytesInput): Promise<SubmitResult>;
-  /** ContractDeploy with `JSON.stringify(params)`. */
+  /** ContractDeploy with `stringifyJson(params)` (`bigint` written exactly). */
   deployContract(contractId: string, contractType: string, params: Record<string, unknown>): Promise<SubmitResult>;
 
   // -- Read wrappers delegating to this.client ------------------------------
 
-  /** JSON-RPC `getBalance` in lamports; defaults to the connected key. */
-  getBalance(address?: string): Promise<number>;
+  /** JSON-RPC `getBalance` in lamports (`U64Output`); defaults to the connected key. */
+  getBalance(address?: string): Promise<U64Output>;
   /** `GET /token/accounts/{address}`; defaults to the connected key. */
   getTokenAccounts(address?: string): Promise<TokenAccounts>;
   /** `GET /v2/account/{address}`; defaults to the connected key. */
@@ -3026,8 +3256,8 @@ export class XerisAgent {
 
   /** `client.getTasks().data` filtered client-side by exact match; unknown filter keys throw `RangeError`. */
   findTasks(filters?: TaskFilters): Promise<TaskEntry[]>;
-  /** Owner's balance in lamports (JSON-RPC `getBalance`). */
-  getBalance(): Promise<number>;
+  /** Owner's balance in lamports (JSON-RPC `getBalance`; `U64Output`). */
+  getBalance(): Promise<U64Output>;
   /** Owner's `GET /token/accounts/{owner}`. */
   getTokenAccounts(): Promise<TokenAccounts>;
   /** `GET /capabilities`. */

@@ -10,19 +10,20 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const sdk = require('..');
 
 const CLASSES = ['XerisClient', 'XerisDApp', 'XerisAgent', 'XerisKeypair'];
 const INSTRUCTION_LAYER = [
   'Instructions', 'Variant', 'VARIANT_NAMES', 'BUILDER_NAMES', 'fromPlan', 'isDisabledVariant', 'encodeSwapCall',
-  'dealTermsHash', 'buildPqRotationMessage', 'channelStateMessage', 'channelCloseMessage',
+  'dealTermsHash', 'buildPqRotationMessage', 'channelStateMessage', 'channelCloseMessage', 'hardwareAttestChallenge',
 ];
 const ENCODING = [
   'encodeU8', 'encodeU32', 'encodeU64', 'encodeBool', 'encodeString', 'encodeBytes', 'encodeFixedBytes',
   'encodeStringVec', 'encodeOption', 'encodeVariant', 'readVariant', 'normalizeU64', 'normalizeU32', 'normalizeU8',
-  'xrsToLamports', 'lamportsToXrs', 'toBaseUnits', 'fromBaseUnits', 'encodeBincodeString', 'encodeBincodeVec',
-  'encodeBincodeStringVec',
+  'xrsToLamports', 'lamportsToXrs', 'toBaseUnits', 'fromBaseUnits', 'stringifyJson', 'parseJson',
+  'encodeBincodeString', 'encodeBincodeVec', 'encodeBincodeStringVec',
 ];
 const TRANSACTION = [
   'blockhashFromHex', 'buildTransaction', 'signTransaction', 'serializeTransaction', 'assembleSignedTransaction',
@@ -52,7 +53,7 @@ const CONSTANTS = [
   'MAX_CONDITIONAL_INNER_BYTES', 'MIN_ORACLE_STAKE_LAMPORTS', 'MIN_VOTING_PERIOD_SLOTS',
   'MAX_VOTING_PERIOD_SLOTS', 'DEFAULT_PROPOSAL_QUORUM', 'MIN_PROPOSAL_STAKE_LAMPORTS',
   'LAUNCHPAD_XERIS_FEE_BPS', 'REGISTRY_PAGE_ITEMS', 'ACCOUNT_HISTORY_MAX_PAGE_SIZE',
-  'ACCOUNT_HISTORY_MAX_PAGE', 'LIST_MAX_PAGE_SIZE', 'TX_STATUSES', 'STRING_LIMITS',
+  'ACCOUNT_HISTORY_MAX_PAGE', 'LIST_MAX_PAGE_SIZE', 'SIGNATURES_MAX_LIMIT', 'PRICE_HISTORY_MAX_LIMIT', 'TX_STATUSES', 'STRING_LIMITS',
 ];
 const EXPECTED = [...CLASSES, ...INSTRUCTION_LAYER, ...ENCODING, ...TRANSACTION, ...ERRORS, ...OTHER, ...CONSTANTS];
 
@@ -62,8 +63,24 @@ test('index.js exports exactly the blueprint §14.1 set', () => {
   for (const name of EXPECTED) assert.notEqual(sdk[name], undefined, name);
 });
 
+test('every export is a named export under Node ESM (cjs-module-lexer detection)', () => {
+  // index.d.ts declares every export as a named export; an ES-module consumer
+  // must be able to import each one by name.
+  const entry = path.join(__dirname, '..', 'index.js');
+  const script = `import * as ns from ${JSON.stringify(entry)};`
+    + "process.stdout.write(JSON.stringify(Object.keys(ns).filter((k) => k !== 'default' && k !== 'module.exports')));";
+  const res = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
+  assert.equal(res.status, 0, res.stderr);
+  assert.deepEqual(JSON.parse(res.stdout).sort(), [...EXPECTED].sort());
+  const named = `import { XerisClient, Instructions, encodeU64, VERSION, STRING_LIMITS, stringifyJson } from ${JSON.stringify(entry)};`
+    + "process.stdout.write([typeof XerisClient, typeof Instructions, typeof encodeU64, typeof VERSION, typeof STRING_LIMITS, typeof stringifyJson].join(','));";
+  const res2 = spawnSync(process.execPath, ['--input-type=module', '-e', named], { encoding: 'utf8' });
+  assert.equal(res2.status, 0, res2.stderr);
+  assert.equal(res2.stdout, 'function,object,function,string,object,function');
+});
+
 test('internal helpers are not exported', () => {
-  for (const name of ['_raw', 'disabledFeature', 'submitBody', 'serializedFromWalletResult', 'concat', 'toBytes', 'assertString']) {
+  for (const name of ['_raw', 'disabledFeature', 'submitBody', 'serializedFromWalletResult', 'concat', 'toBytes', 'assertString', 'isPlainJsonObject', 'assertJsonObjectText']) {
     assert.equal(name in sdk, false, name);
   }
 });
@@ -98,5 +115,6 @@ test('package.json points main/types/exports at the entry files', () => {
   assert.equal(pkg.exports['.'].require, './index.js');
   assert.equal(pkg.exports['.'].types, './index.d.ts');
   assert.equal(pkg.version, sdk.VERSION);
-  assert.deepEqual(Object.keys(pkg.dependencies).sort(), ['@solana/web3.js', 'bs58']);
+  assert.deepEqual(Object.keys(pkg.dependencies).sort(), ['@noble/curves', '@noble/hashes', '@solana/web3.js', 'bs58', 'buffer']);
+  assert.deepEqual(pkg.browser, { fs: false });
 });

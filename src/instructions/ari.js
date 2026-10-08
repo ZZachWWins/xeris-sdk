@@ -58,8 +58,12 @@ const {
   encodeVariant,
   toBytes,
 } = require('../encoding');
+const { Buffer } = require('buffer');
 const { EncodingError, disabledFeature } = require('../errors');
 const { CHANNEL_STATE_TAG, CHANNEL_CLOSE_TAG } = require('../constants');
+
+/** Domain tag of the hardware-attestation challenge (`ledger.rs:5310`). */
+const HW_ATTEST_TAG = 'XRS_HW_ATTEST_V2';
 // bs58 is used only by the channel message helpers, to mirror
 // `id.parse::<solana_sdk::pubkey::Pubkey>()` in `push_identity` (contracts.rs:21-30).
 const bs58 = require('bs58');
@@ -487,9 +491,13 @@ function oracleSubmit(oracleId, value, metadata) {
  * `"XRS_HW_ATTEST_V2" ‖ identity(devicePubkey) ‖ identity(boundIdentity) ‖
  * lp(deviceType) ‖ lp(manufacturer) ‖ lp(model) ‖ lp(firmwareVersion) ‖
  * u64le(block slot)` (`ledger.rs:7311-7332`; challenge layout
- * `ledger.rs:5299-5319`, `lp` and `identity` as in `contracts.rs:12-30`). The
- * challenge binds the slot of the block that includes the transaction, which
- * the submitter cannot know in advance; the node offers no tolerance window.
+ * `ledger.rs:5299-5319`, `lp` and `identity` as in `contracts.rs:12-30`;
+ * build it with `hardwareAttestChallenge`). The challenge binds the slot of
+ * the block that includes the transaction (`block.slot`, `ledger.rs:7320-7322`),
+ * which the submitter cannot know in advance; the node offers no tolerance
+ * window. A proof signed for any other slot fails, the instruction is skipped
+ * and the fee is still charged, so sign for the slot you expect the next
+ * block to have and expect to retry with a new proof.
  *
  * Further node rules, not enforced here: `deviceType` must be one of
  * `humanoid, terminal, iot, mobile, secure_element` (`ledger.rs:7232`); the
@@ -502,7 +510,8 @@ function oracleSubmit(oracleId, value, metadata) {
  * @param {string} manufacturer manufacturer name
  * @param {string} model model name
  * @param {string} firmwareVersion firmware version string
- * @param {Buffer|Uint8Array} attestationProof 64-byte Ed25519 signature over the challenge
+ * @param {Buffer|Uint8Array} attestationProof 64-byte Ed25519 signature by the device key over
+ *   `hardwareAttestChallenge(..., slot)` for the slot of the including block
  * @param {string} boundIdentity identity the device is bound to, `''` for none
  * @returns {Buffer} encoded instruction
  * @throws {EncodingError} wrong argument count (`code: 'arity'`)
@@ -620,8 +629,10 @@ function updateCapability(
  * QueryCapabilities (variant 30, `token.rs:414-420`): encodes the variant for
  * wire-format completeness only. The block dispatcher's arm for this variant
  * is empty (`ledger.rs:7460-7464`): a transaction carrying it is admitted, the
- * flat fee is charged, and nothing is executed or returned. No `XerisClient`
- * wrapper exists for it.
+ * flat fee is charged, and nothing is executed or returned. The SDK's
+ * transaction layer therefore refuses to sign it
+ * (`assertInstructionSubmittable` throws `FeatureDisabledError`
+ * `'QueryCapabilities'`), and no `XerisClient` wrapper exists for it.
  * @deprecated Use `XerisClient.searchCapabilities` (`GET /capabilities/search`,
  *   `network.rs:5583-5615`), which runs the same engine `search`
  *   (`contracts.rs:4655-4674`) without a transaction.
@@ -1410,6 +1421,52 @@ function channelCloseMessage(
 }
 
 /**
+ * Builds the hardware-attestation challenge a device key signs for
+ * `HardwareAttest` (`hw_attest_challenge`, `ledger.rs:5299-5319`):
+ * `"XRS_HW_ATTEST_V2" ‖ identity(devicePubkey) ‖ identity(boundIdentity) ‖
+ * lp(deviceType) ‖ lp(manufacturer) ‖ lp(model) ‖ lp(firmwareVersion) ‖
+ * u64le(slot)`, where `identity(s)` is `0x01 ‖ 32-byte key` for a base58
+ * public key and `0x00 ‖ u32le(len) ‖ utf8(s)` otherwise, and `lp(s)` is
+ * `u32le(len) ‖ utf8(s)` (`contracts.rs:12-30`).
+ *
+ * The node verifies the proof against `slot` = the slot of the block that
+ * includes the transaction (`ledger.rs:7320-7322`; V2 is active from slot 1,
+ * `ledger.rs:7311`). That slot is not known when the transaction is signed,
+ * and the node allows no tolerance window: a proof for any other slot makes
+ * the dispatcher skip the instruction after the fee is charged. Read the
+ * current slot (`XerisClient.getSlot`), sign for the slot you expect the
+ * including block to have, and be prepared to resubmit with a new proof.
+ * Sign the result with the device key: `deviceKeypair.sign(challenge)`.
+ * @param {string} devicePubkey the device's signing address
+ * @param {string} boundIdentity identity the device is bound to, `''` for none
+ * @param {string} deviceType device type string
+ * @param {string} manufacturer manufacturer name
+ * @param {string} model model name
+ * @param {string} firmwareVersion firmware version string
+ * @param {number|bigint} slot slot of the block expected to include the transaction
+ * @returns {Buffer} the challenge bytes to sign
+ * @throws {EncodingError} wrong argument count (`code: 'arity'`)
+ * @throws {TypeError|RangeError} a field has the wrong type, is out of range or contains a lone surrogate
+ */
+function hardwareAttestChallenge(
+  devicePubkey, boundIdentity, deviceType, manufacturer, model, firmwareVersion, slot,
+) {
+  assertArity(arguments.length, 7, 'hardwareAttestChallenge',
+    'devicePubkey, boundIdentity, deviceType, manufacturer, model, firmwareVersion, slot');
+  const lpString = (value, field) => lenPrefixed(Buffer.from(assertString(value, field), 'utf8'));
+  return Buffer.concat([
+    Buffer.from(HW_ATTEST_TAG, 'ascii'),
+    identityBytes(devicePubkey, 'devicePubkey'),
+    identityBytes(boundIdentity, 'boundIdentity'),
+    lpString(deviceType, 'deviceType'),
+    lpString(manufacturer, 'manufacturer'),
+    lpString(model, 'model'),
+    lpString(firmwareVersion, 'firmwareVersion'),
+    encodeU64(slot, 'slot'),
+  ]);
+}
+
+/**
  * The 28 builders for variants 18-45, keyed by camelCase builder name;
  * `subDelegate` is the throwing stub. Aggregated into `Instructions` by
  * `src/instructions/index.js`.
@@ -1455,4 +1512,4 @@ const _raw = Object.freeze({
   subDelegate: rawSubDelegate,
 });
 
-module.exports = { ari, _raw, channelStateMessage, channelCloseMessage };
+module.exports = { ari, _raw, channelStateMessage, channelCloseMessage, hardwareAttestChallenge };
