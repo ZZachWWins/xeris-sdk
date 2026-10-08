@@ -1,18 +1,30 @@
 {
   "name": "xeris-sdk",
-  "version": "4.0.0",
-  "description": "Official JavaScript SDK for the XerisCoin (XRS) Layer 1 blockchain. Build wallets, submit transactions, query chain state, and interact with tokens, smart contracts, launchpads, and the Alexandria RWA protocol.",
+  "version": "5.0.0",
+  "description": "JavaScript SDK for the XerisCoin node: bincode instruction encoding, transaction signing and submission, RPC and explorer queries.",
   "main": "index.js",
   "types": "index.d.ts",
+  "type": "commonjs",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "require": "./index.js",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "index.js",
     "index.d.ts",
+    "src/",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test.js",
-    "test:vectors": "node -e \"const { TestVectors } = require('./'); TestVectors.printAll();\""
+    "test": "node --test test/*.test.js",
+    "test:vectors": "node -e \"require('./').TestVectors.printAll()\""
   },
   "keywords": [
     "xeriscoin",
@@ -47,7 +59,7 @@
     "url": "https://github.com/ZZachWWins/xeris-sdk/issues"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",

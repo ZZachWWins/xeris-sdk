@@ -1,416 +1,144 @@
 # xeris-sdk. Latest OCT 7th, 2026
 
-Official JavaScript SDK for the **XerisCoin (XRS)** Layer 1 blockchain.
-
-Build wallets, DeFi dApps, and **autonomous AI agents** with 54 on-chain instruction types, zero-knowledge proofs, and post-quantum cryptography.
+JavaScript SDK for the XerisCoin node (Node >= 18, CommonJS). Encodes `XerisInstruction` values in the node's bincode layout, signs and submits transactions, and queries the RPC and explorer ports. Citations are `file:line` in the node source (`xeriscointestnet/src/`). Type declarations: `index.d.ts`.
 
 ## Install
 
-```bash
+```sh
 npm install xeris-sdk
 ```
 
-## Quick Start
+## Classes
 
-```javascript
-const { XerisClient, XerisKeypair } = require('xeris-sdk');
+| Class | Who signs | Use |
+|---|---|---|
+| `XerisClient` | the `XerisKeypair` you pass to each call | servers, bots, scripts |
+| `XerisDApp` | the browser wallet (`window.xeris`) | browser dApps |
+| `XerisAgent` | the agent's own key; executes as the owner through `AgentExecute` (variant 17) | delegated agents |
 
-const client = XerisClient.testnet();
-const wallet = XerisKeypair.generate();
-console.log('Address:', wallet.publicKey);
+## Quick start
 
-await client.airdrop(wallet.publicKey, 10);
-await new Promise(r => setTimeout(r, 5000));
+```js
+const { XerisClient, XerisKeypair, lamportsToXrs } = require('xeris-sdk');
 
-const balance = await client.getBalance(wallet.publicKey);
-console.log('Balance:', balance / 1_000_000_000, 'XRS');
+const client = XerisClient.testnet();                       // http://138.197.116.81, ports 56001 / 50008
+const kp = XerisKeypair.fromJsonFile('keypair.json');        // JSON array of 64 bytes (bin/wallet.rs:96-105)
 
-await client.transferXrs(wallet, recipientAddress, 5.0);
+const recipient = 'GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB'; // any canonical base58 pubkey (ledger.rs:1569-1577)
+
+const lamports = await client.getBalance(kp.publicKey);      // JSON-RPC getBalance (explorer.rs:1447-1457)
+console.log(lamportsToXrs(lamports), 'XRS');
+
+const { signature } = await client.transferXrs(kp, recipient, '0.25');  // NativeTransfer via POST /submit
+const tx = await client.waitForConfirmation(signature);      // polls GET /v2/tx/{signature}
+console.log(tx.status);                                      // 'confirmed' | 'failed' | 'partial' | 'included'
 ```
 
----
+`status: 'ok'` from a write call means mempool admission, not confirmation (`network.rs:4847-4856`).
 
-## Building AI Agents on XerisCoin
+## Instructions
 
-XerisCoin has native on-chain infrastructure for autonomous AI agents through the **Xeris Ari Protocol**. An AI agent can register with delegated authority from a human owner, build a verifiable identity, earn reputation, find tasks, negotiate with other agents, and execute trades — all with protocol-enforced spending guardrails.
+`Instructions.<builder>(...)` returns a `Buffer`: `u32le(variant index)` then the fields in `token.rs` declaration order (`token.rs:29-808`, bincode 1 fixint LE). Parameters are positional, named after the Rust fields, in Rust order, strict arity. `Option<T>` takes `null`; `0`, `''`, `[]` are `Some`. Builders encode; node rules are enforced by the class wrappers (`checks.*`).
 
-### The XerisAgent Class
-
-`XerisAgent` is for AI systems (like Ari) running on servers, M4 Macs, or any hardware. The agent holds its own keypair but operates under delegated authority from a human owner. Every transaction goes through `AgentExecute`, which the chain validates against the agent's registered permissions before spending the owner's funds.
-
-```javascript
-const { XerisAgent, XerisKeypair } = require('xeris-sdk');
-
-// Agent has its own keypair
-const agentKeypair = XerisKeypair.generate();
-const ownerPubkey = '8evPjj...'; // the human who delegated authority
-
-const agent = XerisAgent.testnet(agentKeypair, ownerPubkey);
+```js
+const { Instructions, Variant } = require('xeris-sdk');
+const ix = Instructions.nativeTransfer(from, to, 5_000_000_000n);   // variant 11
+await client.sendInstruction(kp, ix);                              // or an array of up to 16
+Variant.NativeTransfer;                                            // 11; 62 variants, 0..61
 ```
 
-### Step 1: Owner Registers the Agent
+Four variants are refused by the node; their builders and wrappers throw `FeatureDisabledError` (`.replacement` names the live path). One encodes but does nothing in a block.
 
-The human owner uses `XerisClient` to register the agent with spending limits:
+| idx | builder | node |
+|---|---|---|
+| 22 | `subDelegate` | rejected at ingress, `"SubDelegate is disabled (XWC-82)"` (`ledger.rs:1445-1450`) |
+| 48 | `zkPrivateTransfer` | skipped by the block dispatcher after the fee is charged (`ledger.rs:8669-8685`) |
+| 49 | `zkIdentityProof` | skipped (`ledger.rs:8687-8697`) |
+| 52 | `pqSignedTransfer` | skipped (`ledger.rs:8809-8828`) |
+| 30 | `queryCapabilities` | no-op in blocks, fee still charged (`ledger.rs:7460-7464`); read with `client.searchCapabilities()` |
 
-```javascript
-const { XerisClient, XerisKeypair } = require('xeris-sdk');
+## Amounts
 
-const client = XerisClient.testnet();
-const owner = XerisKeypair.fromJsonFile('owner-keypair.json');
+- Wrapper parameters whose name ends in `Xrs` (`transferXrs`, `stakeXrs`, `wrapXrs`, ...) take XRS as a `number` or decimal `string` and convert exactly: `xrsToLamports('0.29') === 290000000n`, at most 9 fractional digits (`LAMPORTS_PER_XRS = 1_000_000_000`, `token.rs:901`).
+- Every other amount is base units: `number` up to 2^53-1, or `bigint` up to 2^64-1. Nothing is rounded, clamped or defaulted; an unusable value throws.
 
-await client.registerAgent(
-  owner,
-  'Ari-Trader-v1',           // agent name
-  agentKeypair.publicKey,    // agent's public key
-  5_000_000_000,             // max 5 XRS per transaction
-  10_000_000_000,            // max 10 XRS daily budget
-  ['pool_mtk_xrs'],          // can only trade on this pool
-  ['ContractCall', 'WrapXrs', 'UnwrapXrs'], // allowed operations
-  0                          // no expiration
-);
-```
+## Errors
 
-### Step 2: Agent Creates Its Identity
+| class | thrown for | `.code` |
+|---|---|---|
+| `TypeError` | wrong JavaScript type (`true` for a u64, `number[]` for bytes, `'5'` for a number) | — |
+| `RangeError` | right type, outside the domain (u8 256, negative u64, number > 2^53-1, lone surrogate, unknown enum string) | — |
+| `EncodingError` | wrong argument count, unknown variant, oversize instruction, malformed hex | `encoding`, `arity` |
+| `FeatureDisabledError` | anything the node refuses; `.feature`, `.replacement`, `.citation` | `feature_disabled` |
+| `RpcError` | any node or transport failure, including HTTP 200 bodies with an `error` key; `.route`, `.httpStatus`, `.body`, `.nodeStatus`, `.hint` | `rpc`, `rpc_http`, `rpc_transport`, `rpc_json` |
+| `XerisError` | misconfiguration, timeouts, unsupported wallet provider | `xeris`, `config`, `timeout`, `provider` |
 
-```javascript
-await client.createIdentity(
-  agentKeypair,
-  'Ari Trading Agent v1',
-  'agent',
-  ownerPubkey,  // parent identity
-  JSON.stringify({ model: 'ari-v2.3', capabilities: ['trading', 'analysis'] })
-);
-```
+Messages name the parameter. The write rate limit is `RpcError` `Rate limited. Max 30 write RPCs per minute per IP.`; `XerisClient.isRateLimited(err)` detects it.
 
-### Step 3: Agent Registers Its Model
+## Routes the node refuses
 
-```javascript
-await client.registerModel(
-  agentKeypair,
-  'Ari-v2.3',
-  'sha256_of_model_weights_here',
-  '2.3.0',
-  'pytorch',
-  JSON.stringify({ accuracy: 94, benchmarks: ['finance-v2'] }),
-  4_000_000_000, // 4GB model
-  'local'        // runs on local hardware
-);
-```
+| route | node | SDK |
+|---|---|---|
+| `GET /airdrop/{address}/{amount}` | HTTP 200 `{"error": ..., "status": 501}` (`network.rs:4314-4327`) | `airdrop()` throws; fund with `transferXrs` from a funded key |
+| `POST /stake/claim` | HTTP 501 (`network.rs:5705-5740`) | `claimStakingReward()` throws; rewards are paid to the liquid balance every 900 blocks (`ledger.rs:9372-9438`) |
+| `POST /governance/vote`, `/governance/propose` | HTTP 501 (`network.rs:5788-5817`) | `createProposal` / `castVote` / `executeProposal` (variants 39-41 via `POST /submit`) |
+| `POST /governance/lock`, `/governance/delegate` | HTTP 501 (`network.rs:5838-5867`) | `governanceLock()` / `governanceDelegate()` throw; `getGovernanceLock(address)` reads |
 
-### Step 4: Agent Advertises Capabilities
+## Networks
 
-```javascript
-await client.registerCapability(
-  agentKeypair,
-  'trading',                         // category
-  ['pool_mtk_xrs', 'limit_orders'], // tags
-  'global',                          // region
-  'Automated trading agent for MTK/XRS pair',
-  0,                                 // price (free / negotiable)
-  10,                                // can handle 10 concurrent tasks
-  '{}'
-);
-```
+| | Testnet | Mainnet |
+|---|---|---|
+| host | `138.197.116.81` — `XerisClient.testnet()` | `XerisClient.mainnet(host)` or `XERIS_MAINNET_HOST`; no built-in host (`network.rs:282-300`) |
+| chain id | `xeris-testnet-v1` | `xeris-mainnet-v1` (`ledger.rs:286-287`) |
 
-### Step 5: Agent Finds and Claims Work
+Both: RPC port 56001, explorer port 50008, P2P port 4000 (`main.rs:830-832`); slot 4 s (`main.rs:33`); fee 0.001 XRS per transaction (`ledger.rs:58`); 9 decimals; blockhash valid for 150 slots (`ledger.rs:239`); 30 write requests per minute per IP on `/submit`, `/stake`, `/unstake`, `/pq-register` (`network.rs:4308`).
 
-```javascript
-// Find tasks matching capabilities
-const tasks = await agent.findTasks({ category: 'trading', minReward: 1_000_000_000 });
-console.log('Available tasks:', tasks.length);
+## Staking
 
-// Claim the best one
-if (tasks.length > 0) {
-  await agent.claimTask(tasks[0].task_id);
-  console.log('Claimed task:', tasks[0].title);
+- `stakeXrs` posts to `POST /stake` and `unstakeXrs` to `POST /unstake` (node pre-checks, `status: 'queued'`); pass `{ route: '/submit' }` to use the generic route.
+- On a federated node `Stake` is accepted only from roster keys (`network.rs:2407-2417`).
+- Resulting stake must be >= 1,000 XRS (`ledger.rs:232, 5713-5718`); unbonding 151,200 slots (`ledger.rs:201`); 7% APY paid every 900 blocks to the liquid balance (`ledger.rs:5138-5145, 9372-9438`).
+
+## ZK / PQ
+
+- Live: `zkVkRegister` (signer stake >= 1,000 XRS, `ledger.rs:8480-8491`); `zkProofSubmit` (`proofSystem` must be `'groth16'`, `verificationKeyHash` a registered `vk_id`, `ledger.rs:8566-8573`); `zkProofVerify`.
+- Live: `pqKeyRegister` via `POST /pq-register` (`'dilithium3'`, 1952-byte key, level 3: `crypto.rs:924`, `contracts.rs:6199-6208`); `pqKeyRotate` (sign `buildPqRotationMessage(chainId, oldPk, newPk, rotationCount)` with the currently registered key, `crypto.rs:851-870`); `pqAttest` (stored as self-asserted, `verified = false`, `ledger.rs:8830-8871`).
+- Not live: `ZkPrivateTransfer` (48), `ZkIdentityProof` (49), `PqSignedTransfer` (52). Builders and wrappers throw `FeatureDisabledError`.
+
+## Wallet provider
+
+`XerisDApp` uses `window.xeris` (else `window.solana` with `isXeris`). `connect` and one of `signTransaction` / `signAndSendTransaction` are required; with `signTransaction` the SDK posts `{ tx_base64 }` to `POST /submit` itself.
+
+```ts
+interface XerisWalletProvider {
+  isXeris?: boolean;
+  connect(opts?: { onlyIfTrusted?: boolean }): Promise<{ publicKey: PublicKey | string } | string>;
+  signTransaction?(tx: Transaction): Promise<Transaction | Uint8Array | { signature: Uint8Array | number[] | string } | { signedTransaction: string | Uint8Array }>;
+  signAndSendTransaction?(tx: Transaction): Promise<{ signature: string }>;  // used only without signTransaction
+  signMessage?(message: Uint8Array): Promise<{ signature: Uint8Array }>;
+  disconnect?(): Promise<void>;
+  getRpcUrl?(): Promise<string>;
+  on?(event: 'disconnect' | 'accountChanged', handler: (arg: unknown) => void): void;
+  off?(event: string, handler: Function): void;
 }
 ```
 
-### Step 6: Agent Operates Autonomously
+## Test vectors
 
-```javascript
-// Trade on behalf of the owner (goes through agent guardrails)
-await agent.swapTokens('pool_mtk_xrs', 'mytoken', 1_000_000_000, 900_000_000);
-
-// Wrap XRS for DEX trading
-await agent.wrapXrs(5);
-
-// Use the planning endpoint to get instruction data + quotes
-const plan = await agent.planSwap('pool_mtk_xrs', 'mytoken', 1_000_000_000, 5.0);
-console.log('Expected output:', plan.quote.amount_out);
-console.log('Slippage:', plan.quote.slippage_pct, '%');
-
-// Transfer XRS from owner's balance
-await agent.transferXrs(recipientAddress, 2.0);
+```sh
+npm test               # node --test test/*.test.js   (no network)
+npm run test:vectors   # TestVectors.printAll(): 20 builders against reference bytes
 ```
 
-### Step 7: Agent Sends Heartbeats
-
-```javascript
-// Prove the agent is alive (other agents and the task board check this)
-await agent.heartbeat({
-  modelHash: 'sha256_of_model_weights_here',
-  activeTasks: 1,
-  capacity: 9,
-  status: 'trading: monitoring MTK/XRS price',
-});
-```
-
-### Step 8: Agent Completes Tasks and Earns XRS
-
-```javascript
-// Submit proof of completion
-await agent.completeTask(tasks[0].task_id, 'tx_signature_proving_work_done');
-
-// The task poster verifies, and the reward is paid to the agent
-```
-
-### Step 9: Agent Communicates with Other Agents
-
-```javascript
-// Send a trade proposal to another agent
-await agent.sendMessage(
-  otherAgentPubkey,
-  'proposal',
-  JSON.stringify({ action: 'buy', token: 'MTK', amount: 1000, price: 0.5 }),
-  null // no reply_to (new thread)
-);
-```
-
-### Agent Lifecycle Summary
+`TestVectors.verify()` returns `{ ok, failures }`; `TestVectors.all()` returns the 20 entries. The reference bytes were checked against the `bincode` 1.3.3 crate.
 
 ```
-Owner registers agent with spending limits (RegisterAgent)
-    → Agent creates identity (CreateIdentity)
-    → Agent registers model (RegisterModel)
-    → Agent advertises capabilities (RegisterCapability)
-    → Agent sends heartbeats every ~6 hours (AgentHeartbeat)
-    → Agent finds and claims tasks (ClaimTask)
-    → Agent executes trades within guardrails (AgentExecute)
-    → Agent earns reputation (AttestReputation from others)
-    → Agent earns XRS from task rewards
-    → Owner can revoke at any time (UpdateAgent revoked=true)
+nativeTransfer  stake  tokenMint  tokenTransfer  wrapXrs
+createDeal  acceptDeal  confirmDeal  disputeDeal  zkVkRegister
+agentExecuteNativeTransfer  contractCallSwap  openDispute  forceCloseChannel
+updateAgent  registerAgent  rwaUpdateStatus  agentHeartbeat  postTask  validatorAttestation
 ```
-
----
-
-## Three SDK Classes
-
-| Class | Use Case | Keys |
-|-------|----------|------|
-| `XerisClient` | Server scripts, bots, admin tools | You hold the keypair |
-| `XerisDApp` | Browser dApps in Xeris wallet | Wallet signs via popup |
-| `XerisAgent` | Autonomous AI agents | Agent keypair + delegated authority |
-
----
-
-## DeFi Operations
-
-```javascript
-// Tokens
-await client.createToken(kp, 'mytoken', 'My Token', 'MTK', 9, 1000000);
-await client.mintTokens(kp, 'mytoken', kp.publicKey, 1000, 9);
-await client.transferToken(kp, 'mytoken', bobAddress, 50, 9);
-
-// DEX
-await client.deployContract(kp, 'pool_mtk_xrs', 'swap', {
-  token_a: 'mytoken', token_b: 'xrs_native',
-  amount_a: 100000000000000, amount_b: 10000000000000, fee_bps: 77
-});
-await client.wrapXrs(kp, 10);
-
-// Launchpad
-const quote = await client.getLaunchpadQuote('launch_xyz', 1000000000);
-await client.callContract(kp, 'launch_xyz', 'buy_tokens', {
-  xrs_amount: 1000000000,
-  min_tokens_out: Math.floor(quote.tokens_out * 0.95)
-});
-
-// Staking
-await client.stakeXrs(kp, 1000);
-await client.unstakeXrs(kp, 500);
-
-// Attestation (light client mining)
-const blocks = await client.getRecentBlocks();
-await client.submitAttestation(kp, blocks[0].slot, Buffer.from(blocks[0].hash, 'hex'));
-```
-
----
-
-## Governance
-
-```javascript
-await client.createProposal(kp, 'prop_001', 'Reduce fees to 0.0005 XRS',
-  'Lower transaction fees to increase adoption', 'parameter_change',
-  JSON.stringify({ tx_fee: 500000 }), 151200, 100_000_000_000);
-
-await client.castVote(kp, 'prop_001', 'yes');
-```
-
----
-
-## Zero-Knowledge Proofs
-
-```javascript
-// Send a private transfer (amount hidden on-chain)
-// Handles everything: fetches balance, subtracts fee, generates proofs, submits
-await client.sendZkPrivateTransfer(kp, recipientAddress, 5.0);
-
-// Or with a specific token
-await client.sendZkPrivateTransfer(kp, recipientAddress, 100.0, 'mytoken');
-
-// Generate proofs manually for custom use
-const { createZkPrivateTransferProofs } = require('xeris-sdk');
-const proofs = createZkPrivateTransferProofs(5_000_000_000, senderBalance);
-// proofs.commitment    → 48 bytes (witness data)
-// proofs.balanceProof  → 64 bytes (SHA-256 binding proof)
-// proofs.nullifier     → 32 bytes (double-spend prevention)
-// proofs.blinding      → 32 bytes (keep secret, needed to prove amount later)
-
-// Submit manually
-await client.sendInstruction(kp, Instructions.zkPrivateTransfer(
-  'xrs_native', kp.publicKey, recipientAddress,
-  proofs.commitment, proofs.rangeProof, proofs.balanceProof, proofs.nullifier
-));
-
-// Check proof status
-const stats = await client.getZkStats();
-console.log('Total nullifiers:', stats.nullifiers_used);
-```
-
----
-
-## Post-Quantum Cryptography
-
-```javascript
-// Register a quantum-resistant key (re-registration replaces old key)
-await client.pqKeyRegister(kp, pqPublicKeyBytes, 'dilithium3', 3);
-
-// Build the message to sign with Dilithium
-const message = XerisClient.buildPqTransferMessage(kp.publicKey, recipientAddress, 5.0);
-// Sign with your Dilithium secret key (using pqcrypto-dilithium, liboqs, or WASM)
-const dilithiumSig = dilithium3_sign(secretKey, message); // 3293 bytes
-
-// Send a PQ-signed transfer
-await client.sendPqTransfer(kp, recipientAddress, 5.0, dilithiumSig);
-
-// Check PQ key status
-const pqInfo = await client.getPqKey(kp.publicKey);
-console.log('Algorithm:', pqInfo.algorithm);
-console.log('Protected:', pqInfo.has_pq_key);
-
-// Network quantum readiness
-const pqStatus = await client.getPqStatus();
-console.log('PQ keys registered:', pqStatus.total_registered);
-```
-
----
-
-## Oracle Data Feeds
-
-```javascript
-// Register an oracle (stakes XRS as collateral)
-await client.registerOracle(kp, 'eth_price_usd', 'Ethereum price feed', 'price', 100, 10_000_000_000);
-
-// Submit data
-await client.oracleSubmit(kp, 'eth_price_usd', 384200000000, '{"source": "coingecko"}');
-```
-
----
-
-## Queries
-
-```javascript
-// Chain state
-await client.getStats();
-await client.getNetworkEconomics();
-await client.getHealth();
-
-// Accounts
-await client.getBalance(address);
-await client.getAccountInfo(address);
-await client.getTokenAccounts(address);
-
-// Agent system
-await client.getAgentRegistry(ownerAddress);
-await client.validateAgent(agentPubkey, ownerPubkey);
-await client.agentPlan({ action: 'swap', pool_id: 'pool_mtk_xrs', token_in: 'mytoken', amount_in: 1000000000 });
-
-// Capabilities and tasks
-await client.searchCapabilities({ category: 'trading', min_rep: 50 });
-await client.getTasks();
-
-// ZKP and PQC
-await client.getZkProofs(identityPubkey);
-await client.getZkStats();
-await client.getPqKey(address);
-await client.getPqStatus();
-
-// Explorer
-await client.getBlocks(1, 20);
-await client.getTransaction(signature);
-await client.getValidators();
-await client.search('anything');
-```
-
----
-
-## Custom Instructions
-
-Build any instruction from the 54 variants using the low-level API:
-
-```javascript
-const { Instructions, encodeU32, encodeU64, encodeBincodeString } = require('xeris-sdk');
-
-// Pre-built instruction
-const ix = Instructions.nativeTransfer(from, to, lamports);
-await client.sendInstruction(keypair, ix);
-
-// Or encode manually
-const custom = Buffer.concat([
-  encodeU32(11),                    // variant index (NativeTransfer)
-  encodeBincodeString(fromAddr),
-  encodeBincodeString(toAddr),
-  encodeU64(amount),
-]);
-```
-
----
-
-## Network Info
-
-| | Testnet |
-|---|---|
-| Seed Node | `138.197.116.81` |
-| RPC Port | `56001` |
-| Explorer Port | `50008` |
-| P2P Port | `4000` |
-| Block Time | 4 seconds |
-| Decimals | 9 (1 XRS = 1,000,000,000 lamports) |
-| Instruction Variants | 54 |
-| Contract Types | 20 |
-
----
-
-## TypeScript
-
-Full type definitions included:
-
-```typescript
-import { XerisClient, XerisKeypair, XerisAgent, XerisDApp } from 'xeris-sdk';
-```
-
----
-
-## Test Vectors
-
-```bash
-node -e "require('xeris-sdk').TestVectors.printAll()"
-npm test
-```
-
----
 
 ## License
 
-MIT — Xeris Technologies LLC — https://xerisweb.com
+MIT — see `LICENSE`.
