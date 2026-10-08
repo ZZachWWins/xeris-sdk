@@ -5,13 +5,18 @@
  *
  * The node deserializes every write-route body as
  * `{"tx_base64": base64(bincode::serialize(&solana_sdk::transaction::Transaction))}`
- * (`src/network.rs:1575-1578, 4668-4675`). A `@solana/web3.js` legacy
- * `Transaction.serialize()` emits exactly that byte layout (compact-u16
- * `short_vec` lengths, raw 64-byte signatures, 3-byte header, raw 32-byte keys
- * and blockhash, compact-u16 account indexes and data; `src/ledger.rs:109-119`,
- * `src/tx_pool.rs:25-30`), and signs `serializeMessage()`, the same bytes the
- * node's `tx.verify()` checks (`src/network.rs:201`). The reference wallet
- * builds the identical transaction in Rust (`src/bin/wallet.rs:180-190, 516-525`).
+ * (`src/network.rs:1575-1578, 4668-4675`): compact-u16 `short_vec` lengths,
+ * raw 64-byte signatures, 3-byte header, raw 32-byte keys and blockhash,
+ * compact-u16 account indexes and data (`src/ledger.rs:109-119`,
+ * `src/tx_pool.rs:25-30`); the signature covers the message bytes, which is
+ * what the node's `tx.verify()` checks (`src/network.rs:201`). The reference
+ * wallet builds the identical transaction in Rust (`src/bin/wallet.rs:180-190,
+ * 516-525`). A `@solana/web3.js` legacy `Transaction` is the carrier object;
+ * for the layout `buildTransaction` produces, this module encodes the message
+ * and the wire bytes itself (`messageBytes`), because web3.js 1.x refuses
+ * messages above 1232 bytes while the node admits instruction data up to 8192
+ * bytes (65,535 for SlashReport) and transactions up to 128 KiB
+ * (`src/network.rs:145-189`, `src/tx_pool.rs:183`).
  *
  * Single-signer layout (blueprint §9.4 golden vector, 206 bytes for a 36-byte
  * NativeTransfer):
@@ -95,6 +100,114 @@ const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/
 /** @param {unknown} v @returns {boolean} */
 function isByteArray(v) {
   return v instanceof Uint8Array;
+}
+
+/** Largest value a Solana `short_vec` (compact-u16) length can carry. */
+const COMPACT_U16_MAX = 0xffff;
+
+/**
+ * Solana `short_vec` length prefix (compact-u16: 7 bits per byte, LSB first,
+ * high bit = continuation; 1-3 bytes). Used for the signature, account-key,
+ * instruction, account-index and data lengths of a legacy transaction.
+ * @param {number} n
+ * @returns {Buffer}
+ * @throws {RangeError} When `n` is not an integer in `0..=65535`.
+ */
+function compactU16(n) {
+  if (!Number.isInteger(n) || n < 0 || n > COMPACT_U16_MAX) {
+    throw new RangeError(`short_vec length ${n} is outside 0..=${COMPACT_U16_MAX}`);
+  }
+  const out = [];
+  let rem = n;
+  for (;;) {
+    const byte = rem & 0x7f;
+    rem >>= 7;
+    if (rem === 0) {
+      out.push(byte);
+      return Buffer.from(out);
+    }
+    out.push(byte | 0x80);
+  }
+}
+
+/**
+ * True when `tx` has the layout `buildTransaction` produces: fee payer and
+ * blockhash set, no durable nonce, and every instruction with the zero
+ * program id and exactly one account, the fee payer as writable signer.
+ * Such a transaction is serialized by this module (`messageBytes`) rather
+ * than by web3.js.
+ * @param {Transaction} tx
+ * @returns {boolean}
+ */
+function isSdkShape(tx) {
+  if (!tx.feePayer || !tx.recentBlockhash || tx.nonceInfo || tx.instructions.length === 0) return false;
+  if (tx.feePayer.equals(PROGRAM_ID)) return false;
+  return tx.instructions.every((ix) => ix.programId.equals(PROGRAM_ID)
+    && ix.keys.length === 1
+    && ix.keys[0].pubkey.equals(tx.feePayer)
+    && ix.keys[0].isSigner === true
+    && ix.keys[0].isWritable === true);
+}
+
+/**
+ * Serializes the legacy message of an SDK-shaped transaction (`isSdkShape`)
+ * exactly as `bincode::serialize(&solana_sdk::message::Message)` does:
+ * header `[1, 0, 1]`, `short_vec` of the two account keys `[payer, zero
+ * program id]`, the 32-byte blockhash, then `short_vec` of instructions, each
+ * `program_id_index = 1`, `short_vec` accounts `[0]`, `short_vec` data.
+ *
+ * web3.js 1.x `Message.serialize()` writes the instructions into a fixed
+ * `PACKET_DATA_SIZE` (1232-byte) buffer and throws above it. The node has no
+ * such cap: it admits instruction data up to `MAX_IX_DATA_SIZE` (65,535 for
+ * SlashReport) and transactions up to `MAX_TX_BYTES` (`network.rs:145-189`,
+ * `tx_pool.rs:183`), and a PqKeyRegister alone is 2035 bytes. This encoder
+ * produces the same bytes as web3.js below 1232 bytes (checked against the
+ * golden vector in `test/transaction.test.js`) and keeps working above it.
+ * @param {Transaction} tx An SDK-shaped transaction.
+ * @returns {Buffer} message bytes (what the signature covers, `network.rs:201`).
+ * @throws {EncodingError} When the blockhash is not 32 bytes of base58.
+ * @throws {RangeError} When an instruction's data exceeds 65,535 bytes.
+ */
+function messageBytes(tx) {
+  let blockhash;
+  try {
+    blockhash = Buffer.from(bs58.decode(tx.recentBlockhash));
+  } catch (cause) {
+    throw new EncodingError('tx: recentBlockhash is not base58', { field: 'tx', cause });
+  }
+  if (blockhash.length !== BLOCKHASH_LEN) {
+    throw new EncodingError(`tx: recentBlockhash decodes to ${blockhash.length} bytes, expected ${BLOCKHASH_LEN}`, { field: 'tx' });
+  }
+  const parts = [
+    Buffer.from([1, 0, 1]),
+    compactU16(2),
+    tx.feePayer.toBuffer(),
+    PROGRAM_ID.toBuffer(),
+    blockhash,
+    compactU16(tx.instructions.length),
+  ];
+  for (const ix of tx.instructions) {
+    const data = Buffer.from(ix.data);
+    parts.push(Buffer.from([1]), compactU16(1), Buffer.from([0]), compactU16(data.length), data);
+  }
+  return Buffer.concat(parts);
+}
+
+/**
+ * Message bytes of any legacy transaction: `messageBytes` for the SDK shape,
+ * otherwise web3.js `serializeMessage()` (limited by web3.js to 1232 bytes).
+ * @param {Transaction} tx
+ * @param {string} field Name used in error messages.
+ * @returns {Buffer}
+ * @throws {EncodingError} When the message cannot be serialized.
+ */
+function messageOf(tx, field) {
+  if (isSdkShape(tx)) return messageBytes(tx);
+  try {
+    return Buffer.from(tx.serializeMessage());
+  } catch (cause) {
+    throw new EncodingError(`${field}: cannot serialize message: ${cause && cause.message ? cause.message : String(cause)}`, { field, cause });
+  }
 }
 
 /** @param {unknown} v @returns {string} */
@@ -258,9 +371,12 @@ function buildTransaction(payerPubkey, instructions, recentBlockhash) {
 }
 
 /**
- * Signs a transaction with the fee payer's keypair (`tx.sign(keypair.solanaKeypair)`).
- * The signature covers `tx.serializeMessage()`, which is what the node's
- * `tx.verify()` checks (`src/network.rs:201`).
+ * Signs a transaction with the fee payer's keypair. The signature covers the
+ * serialized message, which is what the node's `tx.verify()` checks
+ * (`src/network.rs:201`). For the layout `buildTransaction` produces, the
+ * message is encoded by this module (no 1232-byte web3.js limit) and the
+ * signature is stored as `tx.signatures = [{ publicKey: feePayer, signature }]`;
+ * any other legacy transaction is signed with web3.js `tx.sign`.
  * @param {Transaction} tx Output of `buildTransaction` (or any legacy `Transaction` with `feePayer` and `recentBlockhash` set).
  * @param {XerisKeypair} keypair Must be the fee payer.
  * @returns {Transaction} The same object, now signed.
@@ -279,30 +395,50 @@ function signTransaction(tx, keypair) {
       `keypair: ${keypair.publicKey} is not the fee payer ${feePayer}; the node treats account_keys[0] as signer and fee payer (ledger.rs:5506)`,
     );
   }
-  tx.sign(keypair.solanaKeypair);
+  if (isSdkShape(tx)) {
+    tx.signatures = [{ publicKey: tx.feePayer, signature: keypair.sign(messageBytes(tx)) }];
+  } else {
+    tx.sign(keypair.solanaKeypair);
+  }
   return tx;
 }
 
 /**
  * Serializes a signed transaction to the bytes the node deserializes
- * (`bincode::deserialize::<Transaction>`, `src/network.rs:4672`). web3.js
- * verifies every signature while serializing, so an unsigned or mis-signed
- * transaction throws here rather than at the node.
+ * (`bincode::deserialize::<Transaction>`, `src/network.rs:4672`):
+ * `short_vec` signatures ‖ message. The signature is verified first, so an
+ * unsigned or mis-signed transaction throws here rather than at the node.
+ * The layout `buildTransaction` produces is serialized by this module (see
+ * `messageBytes`); any other legacy transaction by web3.js `serialize()`.
  * @param {Transaction} tx Signed legacy transaction.
  * @returns {Buffer} Serialized bytes, at most `MAX_TX_BYTES`.
  * @throws {TypeError} When `tx` is not a legacy `Transaction`.
- * @throws {EncodingError} When web3.js cannot serialize it (missing or invalid signature, no blockhash).
+ * @throws {EncodingError} When it cannot be serialized (missing or invalid signature, no blockhash).
  * @throws {RangeError} When the result exceeds `MAX_TX_BYTES` (`src/tx_pool.rs:183`).
  */
 function serializeTransaction(tx) {
   assertTransaction(tx, 'tx');
-  let bytes;
-  try {
-    bytes = tx.serialize();
-  } catch (cause) {
-    throw new EncodingError(`tx: cannot serialize: ${cause && cause.message ? cause.message : String(cause)}`, { field: 'tx', cause });
+  let buf;
+  if (isSdkShape(tx)) {
+    const message = messageBytes(tx);
+    const entry = tx.signatures.length === 1 ? tx.signatures[0] : null;
+    if (!entry || !entry.publicKey || !entry.publicKey.equals(tx.feePayer) || !entry.signature) {
+      throw new EncodingError('tx: cannot serialize: missing the fee payer signature (sign it with signTransaction)', { field: 'tx' });
+    }
+    const signature = Buffer.from(entry.signature);
+    if (signature.length !== SIGNATURE_LEN || !XerisKeypair.verify(tx.feePayer.toBuffer(), message, signature)) {
+      throw new EncodingError(`tx: cannot serialize: signature does not verify for fee payer ${tx.feePayer.toBase58()}`, { field: 'tx' });
+    }
+    buf = Buffer.concat([compactU16(1), signature, message]);
+  } else {
+    let bytes;
+    try {
+      bytes = tx.serialize();
+    } catch (cause) {
+      throw new EncodingError(`tx: cannot serialize: ${cause && cause.message ? cause.message : String(cause)}`, { field: 'tx', cause });
+    }
+    buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
   }
-  const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
   if (buf.length > MAX_TX_BYTES) {
     throw new RangeError(`tx: serialized transaction is ${buf.length} bytes, above MAX_TX_BYTES = ${MAX_TX_BYTES} (tx_pool.rs:183); the mempool refuses it`);
   }
@@ -431,7 +567,7 @@ function signatureFromValue(value) {
  * Classifies raw wallet bytes as either a complete signed transaction for
  * `message` or a detached 64-byte signature.
  * @param {Buffer} raw
- * @param {Buffer} message `unsignedTx.serializeMessage()`
+ * @param {Buffer} message the message bytes of the unsigned transaction
  * @returns {{txBytes: Buffer|null, signature: Buffer|null}}
  * @throws {XerisError} code `'provider'`
  */
@@ -451,16 +587,17 @@ function classifyBytes(raw, message) {
  * into the serialized signed transaction, and verifies it before returning.
  *
  * Accepted shapes (the same ones the Xeris sites handle, `XerisDex/src/lib/xerisTx.ts:467-520`):
- *  1. a web3 `Transaction` (has `serialize()`) → `serialize()`;
+ *  1. a web3 `Transaction` (has `serialize()`): the fee payer's entry in
+ *     `signatures` placed over the message, else `serialize()`;
  *  2. `Uint8Array`/`Buffer`: the complete serialized signed transaction
  *     (`bytes[0] === 1`, length `65 + message.length`, message bytes equal), or a
  *     64-byte detached signature;
  *  3. `{ signature }`: 64 bytes as `Uint8Array`/`number[]`, or a base58 or base64
- *     string decoding to 64 bytes → `unsignedTx.addSignature(payer, sig)` then `serialize()`;
+ *     string decoding to 64 bytes, placed over the message (`unsignedTx` is not modified);
  *  4. `{ signedTransaction }`: base64 string or bytes, treated as 2.
  *
  * Whatever the shape, the result must be a single-signature transaction whose
- * message equals `unsignedTx.serializeMessage()` (fee payer, blockhash and
+ * message equals the message of `unsignedTx` (fee payer, blockhash and
  * instructions unchanged) and whose signature verifies for `unsignedTx.feePayer`
  * (`XerisKeypair.verify`), i.e. what the node's `tx.verify()` will accept
  * (`src/network.rs:201`).
@@ -476,12 +613,7 @@ function serializedFromWalletResult(result, unsignedTx) {
   if (!unsignedTx.feePayer) throw new EncodingError('unsignedTx: feePayer is not set; build it with buildTransaction', { field: 'unsignedTx' });
   if (!unsignedTx.recentBlockhash) throw new EncodingError('unsignedTx: recentBlockhash is not set; build it with buildTransaction', { field: 'unsignedTx' });
   const payer = unsignedTx.feePayer;
-  let message;
-  try {
-    message = Buffer.from(unsignedTx.serializeMessage());
-  } catch (cause) {
-    throw new EncodingError(`unsignedTx: cannot serialize message: ${cause && cause.message ? cause.message : String(cause)}`, { field: 'unsignedTx', cause });
-  }
+  const message = messageOf(unsignedTx, 'unsignedTx');
   // message[0] = header.num_required_signatures; the signer/payer layout here is single-signer.
   if (message[0] !== 1) {
     throw new EncodingError(`unsignedTx: requires ${message[0]} signatures; wallet results are resolved for single-signer transactions only`, { field: 'unsignedTx' });
@@ -490,11 +622,21 @@ function serializedFromWalletResult(result, unsignedTx) {
   let txBytes = null;
   let signature = null;
   if (result !== null && typeof result === 'object' && !isByteArray(result) && typeof result.serialize === 'function') {
-    // 1. web3 Transaction (any web3.js copy; duck-typed)
-    try {
-      txBytes = Buffer.from(result.serialize());
-    } catch (cause) {
-      throw providerError(`returned Transaction cannot be serialized (unsigned or invalid signature): ${cause && cause.message ? cause.message : String(cause)}`, cause);
+    // 1. web3 Transaction (any web3.js copy; duck-typed). The fee payer's
+    // signature is taken from `signatures` and placed over `message`, so a
+    // transaction whose message is above web3.js's 1232-byte serialize limit
+    // still resolves; a wallet that changed the message fails verification below.
+    const entry = Array.isArray(result.signatures)
+      ? result.signatures.find((e) => e && e.publicKey && typeof e.publicKey.toBase58 === 'function' && e.publicKey.toBase58() === payer.toBase58())
+      : undefined;
+    if (entry && entry.signature) {
+      signature = signatureFromValue(entry.signature instanceof Uint8Array ? entry.signature : Buffer.from(entry.signature));
+    } else {
+      try {
+        txBytes = Buffer.from(result.serialize());
+      } catch (cause) {
+        throw providerError(`returned Transaction cannot be serialized (unsigned or invalid signature): ${cause && cause.message ? cause.message : String(cause)}`, cause);
+      }
     }
   } else if (isByteArray(result)) {
     // 2. raw bytes
@@ -517,12 +659,8 @@ function serializedFromWalletResult(result, unsignedTx) {
   }
 
   if (txBytes === null) {
-    try {
-      unsignedTx.addSignature(payer, signature);
-      txBytes = Buffer.from(unsignedTx.serialize());
-    } catch (cause) {
-      throw providerError(`signature does not verify for fee payer ${payer.toBase58()}: ${cause && cause.message ? cause.message : String(cause)}`, cause);
-    }
+    // Single-signer wire layout: short_vec(1) ‖ signature ‖ message; verified below.
+    txBytes = Buffer.concat([compactU16(1), signature, message]);
   }
 
   if (txBytes.length < MESSAGE_OFFSET || txBytes[0] !== 1) {

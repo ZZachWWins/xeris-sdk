@@ -21,7 +21,7 @@ Rebuilt against the node source (`xeriscointestnet`, crate `xrs-node` 0.1.1). Ev
 - `XerisAgent` constructor requires `host`; `heartbeat(currentModelHash, activeTasks, availableCapacity, statusMessage)` takes four positional arguments.
 - `getAccountInfo` keeps the explorer `GET /v2/account/{address}` shape; the JSON-RPC `getAccountInfo` is `getAccountInfoRpc`.
 - `TestVectors.<entry>()` now returns `{ name, variant, index, description, inputs, hex, bytes, length, expectedHex }`; `bytes` is a `Buffer` (was `number[]`). `description` and `hex` are unchanged.
-- Node >= 18 (global `fetch`, `AbortController`, `crypto.sign(null, ...)`). `test.js` is replaced by `test/` (`npm test` runs `node --test test/`).
+- Node >= 18 (global `fetch`, `AbortController`, `crypto.sign(null, ...)`). `test.js` is replaced by `test/` (`npm test` runs `node --test test/*.test.js`).
 
 ### Added
 
@@ -29,9 +29,13 @@ Rebuilt against the node source (`xeriscointestnet`, crate `xrs-node` 0.1.1). Ev
 - Encoding: `encodeString`, `encodeBytes`, `encodeStringVec` (the `encodeBincode*` names remain as aliases), `encodeFixedBytes`, `encodeVariant`, `readVariant`, `normalizeU64` / `normalizeU32` / `normalizeU8`, `xrsToLamports`, `lamportsToXrs`, `toBaseUnits`, `fromBaseUnits`.
 - Message helpers: `dealTermsHash`, `buildPqRotationMessage`, `channelStateMessage`, `channelCloseMessage`.
 - `XerisKeypair.sign` / `verify` / `fromSeed` / `publicKeyBytes`; `isCanonicalPubkey`, `pubkeyBytes`.
-- Transaction layer: `blockhashFromHex`, `buildTransaction`, `signTransaction`, `serializeTransaction`, `assembleSignedTransaction`, `assertInstructionSubmittable`, `parseSubmitResponse`, `signatureOf`.
+- Transaction layer: `blockhashFromHex`, `buildTransaction`, `signTransaction`, `serializeTransaction`, `assembleSignedTransaction`, `assertInstructionSubmittable`, `parseSubmitResponse`, `signatureOf`. For the single-signer layout `buildTransaction` produces, the SDK encodes the message and wire bytes itself instead of calling web3.js `serialize()`, whose 1.x message buffer is fixed at 1232 bytes. The node admits instruction data up to 8192 bytes (65,535 for SlashReport) and transactions up to 128 KiB (`network.rs:145-189`, `tx_pool.rs:183`), so `pqKeyRegister` (a 2035-byte instruction), `pqKeyRotate` (5351 bytes) and large `slashReport` / `zkVkRegister` / `contractDeploy` payloads can now be sent. The bytes equal web3.js output below 1232 bytes and were checked against `solana-transaction` 2.2.3 (the node's version) with `sanitize()`, `verify()` and byte-exact re-serialization up to 123 KB.
 - `XerisClient`: `mainnet`, `getLatestBlockhashInfo`, `submitSignedTransaction`, `waitForConfirmation`, `isRateLimited`, `transferLamports`, `swap`, `swapByToken`, `createRwaToken`, `rwaUpdateStatus`, `rwaTransfer`, `updateIdentity`, `updateModel`, `forceCloseChannel`, `zkVkRegister`, seven deal wrappers, `getUnstaking`, `getVestingStatus`, `getGovernanceProposals`, `getGovernanceLock`, `getPriceHistory`, `getAllPoolPriceHistory`, `getTokens`, `getTokenHolders`, `getRwaTokens`, `getRwa`, `getContractsV2`, `getContractV2`, `getPools`, `getAccountInfoRpc`, `getBlockRpc`, `getTransactionRpc`, `getHealthRpc`, `getVersion`, `planStake` / `planWrap` / `planUnwrap`.
 - `XerisAgent.mainnet`; `checks` (node business rules as pure functions); error classes `XerisError`, `EncodingError`, `FeatureDisabledError`, `RpcError` and the `DISABLED_FEATURES` table; the node constants in `src/constants.js` (each cited to the node source); `index.d.ts`; `TestVectors.all` / `verify` (20 vectors).
+
+### Known limitations
+
+- `XerisDApp` hands the unsigned web3.js `Transaction` to the wallet's `signTransaction`. A wallet that serializes it with web3.js 1.x cannot sign a message above 1232 bytes (for example a raw `PqKeyRegister` through `sendInstruction`); send those with `XerisClient` and a keypair, or through a wallet that serializes the message without that limit.
 
 ### Migration
 

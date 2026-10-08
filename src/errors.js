@@ -197,7 +197,7 @@ const DISABLED_FEATURES = Object.freeze({
   // is_launchpad_contract branch of the delegated ContractCall path (ledger.rs:6554-6556, XWC-07).
   agentLaunchpad: Object.freeze({
     message: 'AgentExecute inner calls to Launchpad contracts are rejected by the node (XWC-07). The owner must sign launchpad buys and sells directly.',
-    replacement: 'XerisClient.buyOnLaunchpad / XerisDApp.buyOnLaunchpad',
+    replacement: 'XerisClient.buyOnLaunchpad / sellOnLaunchpad, XerisDApp.buyOnLaunchpad / sellOnLaunchpad',
     citation: 'ledger.rs:6554-6556',
   }),
   // is_rwa_contract branch of the delegated ContractCall path (ledger.rs:6557-6561, XWC-03).

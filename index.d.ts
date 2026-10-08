@@ -422,7 +422,69 @@ export const RWA_ASSET_TYPES: readonly ['real_estate', 'equity', 'debt', 'commod
 /** `RWAUpdateStatus.new_status` values (`token.rs:1272`). */
 export const RWA_STATUSES: readonly ['active', 'frozen', 'redeemed', 'disputed', 'revoked'];
 /** Lower-case deploy aliases mapped to `ContractType` enum names (`contracts.rs:385-411`). */
-export const CONTRACT_TYPE_ALIASES: Readonly<Record<ContractTypeAlias, ContractTypeName>>;
+export const CONTRACT_TYPE_ALIASES: {
+  readonly timelock: 'TimeLock';
+  readonly time_lock: 'TimeLock';
+  readonly escrow: 'Escrow';
+  readonly swap: 'Swap';
+  readonly vesting: 'Vesting';
+  readonly multisig: 'MultiSig';
+  readonly multi_sig: 'MultiSig';
+  readonly rwa: 'RealWorldAsset';
+  readonly real_world_asset: 'RealWorldAsset';
+  readonly realworldasset: 'RealWorldAsset';
+  readonly launchpad: 'Launchpad';
+  readonly launch_pad: 'Launchpad';
+  readonly agent_registry: 'AgentRegistry';
+  readonly agent: 'AgentRegistry';
+  readonly agents: 'AgentRegistry';
+  readonly identity: 'IdentityRegistry';
+  readonly identity_registry: 'IdentityRegistry';
+  readonly conditional: 'ConditionalOrderBook';
+  readonly conditional_orders: 'ConditionalOrderBook';
+  readonly orders: 'ConditionalOrderBook';
+  readonly limit: 'LimitOrder';
+  readonly limit_order: 'LimitOrder';
+  readonly limit_orders: 'LimitOrder';
+  readonly dca: 'DcaOrder';
+  readonly dca_order: 'DcaOrder';
+  readonly dollar_cost_averaging: 'DcaOrder';
+  readonly oracle: 'OracleRegistry';
+  readonly oracle_registry: 'OracleRegistry';
+  readonly oracles: 'OracleRegistry';
+  readonly device: 'DeviceRegistry';
+  readonly device_registry: 'DeviceRegistry';
+  readonly hardware: 'DeviceRegistry';
+  readonly capability: 'CapabilityRegistry';
+  readonly capabilities: 'CapabilityRegistry';
+  readonly cap_registry: 'CapabilityRegistry';
+  readonly task: 'TaskBoard';
+  readonly tasks: 'TaskBoard';
+  readonly task_board: 'TaskBoard';
+  readonly bounty: 'TaskBoard';
+  readonly model: 'ModelRegistry';
+  readonly model_registry: 'ModelRegistry';
+  readonly models: 'ModelRegistry';
+  readonly dispute: 'DisputeRegistry';
+  readonly disputes: 'DisputeRegistry';
+  readonly arbitration: 'DisputeRegistry';
+  readonly governance: 'Governance';
+  readonly gov: 'Governance';
+  readonly dao: 'Governance';
+  readonly channel: 'StateChannelRegistry';
+  readonly channels: 'StateChannelRegistry';
+  readonly state_channel: 'StateChannelRegistry';
+  readonly zk: 'ZkVerifierRegistry';
+  readonly zk_verifier: 'ZkVerifierRegistry';
+  readonly zero_knowledge: 'ZkVerifierRegistry';
+  readonly pq: 'PqKeyRegistry';
+  readonly pq_keys: 'PqKeyRegistry';
+  readonly post_quantum: 'PqKeyRegistry';
+  readonly quantum: 'PqKeyRegistry';
+  readonly deal: 'DealRegistry';
+  readonly deals: 'DealRegistry';
+  readonly escrow_deal: 'DealRegistry';
+};
 /** Enum names a user `ContractDeploy` is refused for (`ledger.rs:2344-2349`). */
 export const PROTOCOL_MANAGED_CONTRACT_TYPES: readonly ['DeviceRegistry', 'ZkVerifierRegistry', 'PqKeyRegistry', 'ConditionalOrderBook', 'DisputeRegistry', 'DealRegistry', 'TaskBoard', 'StateChannelRegistry'];
 /** Reserved contract id prefixes (`ledger.rs:1524-1530`). */
@@ -1126,14 +1188,22 @@ export function assertInstructionSubmittable(data: BytesInput, index?: number): 
 export function buildTransaction(payerPubkey: string, instructions: BytesInput | readonly BytesInput[], recentBlockhash: BytesInput): Transaction;
 
 /**
- * Signs `tx` in place with `keypair.solanaKeypair` and returns it.
+ * Signs `tx` in place and returns it. For the layout `buildTransaction`
+ * produces, the SDK encodes the message itself (no 1232-byte web3.js limit)
+ * and sets `tx.signatures`; other legacy transactions use web3.js `tx.sign`.
  * @throws {TypeError} When `tx` is not a legacy `Transaction` or `keypair` is not a `XerisKeypair`.
+ * @throws {EncodingError} When `tx` has no `feePayer` or `recentBlockhash`.
+ * @throws {RangeError} When `keypair` is not the fee payer.
  */
 export function signTransaction(tx: Transaction, keypair: XerisKeypair): Transaction;
 
 /**
- * `tx.serialize()`: the bytes the node decodes with `bincode` (`network.rs:4668-4675`).
+ * The bytes the node decodes with `bincode` (`network.rs:4668-4675`):
+ * `short_vec` signatures ‖ message, after verifying the fee payer's signature.
+ * SDK-layout transactions are encoded by the SDK (up to `MAX_TX_BYTES`); other
+ * legacy transactions by web3.js `tx.serialize()`.
  * @throws {TypeError} When `tx` is not a legacy `Transaction`.
+ * @throws {EncodingError} When the signature is missing or does not verify.
  * @throws {RangeError} When the result exceeds `MAX_TX_BYTES` (`tx_pool.rs:183`).
  */
 export function serializeTransaction(tx: Transaction): Buffer;
